@@ -12,7 +12,7 @@ import websockets
 from loguru import logger
 
 # Model path
-DEFAULT_MODEL_PATH = "/workspace/weights/Parakeet_Reatime_En_600M.nemo"
+DEFAULT_MODEL_PATH = "/workspace/models/Parakeet_Reatime_En_600M.nemo"
 
 # Right context options for att_context_size=[70, X]
 RIGHT_CONTEXT_OPTIONS = {

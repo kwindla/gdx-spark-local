@@ -13,7 +13,7 @@ git clone https://github.com/yourusername/nemotron-speech.git
 cd nemotron-speech
 
 # 2. Download model weights (see "Model Weights" section for details)
-#    - ASR: weights/Parakeet_Reatime_En_600M.nemo (~2.4GB)
+#    - ASR: models/Parakeet_Reatime_En_600M.nemo (~2.4GB)
 #    - LLM: models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/ (~60GB)
 
 # 3. Build containers (takes 1-3 hours each due to PyTorch compilation)
@@ -22,15 +22,14 @@ docker build -f Dockerfile.vllm-cuda13-build -t vllm:cuda13-full .
 
 # 4. Start ASR server (port 8080)
 docker run -d --name nemotron-asr --gpus all --ipc=host \
-  -v $(pwd)/weights:/workspace/weights:ro -p 8080:8080 \
+  -v $(pwd)/models:/workspace/models:ro -p 8080:8080 \
   nemotron-asr:cuda13-full python -m nemotron_speech.server --port 8080
 
 # 5. Start LLM server (port 8000) - see README for full command
 
-# 6. Test from host
-pip install websockets openai
-python examples/asr_client.py tests/fixtures/harvard_16k.wav
-python examples/llm_client.py "Hello, who are you?"
+# 6. Test from host (using uv)
+uv run --with websockets examples/asr_client.py tests/fixtures/harvard_16k.wav
+uv run --with openai examples/llm_client.py "Hello, who are you?"
 ```
 
 ## Requirements
@@ -51,19 +50,10 @@ docker build -f Dockerfile.asr-cuda13-build -t nemotron-asr:cuda13-full .
 
 # Run the ASR server
 docker run --rm --gpus all --ipc=host \
-  -v $(pwd)/weights:/workspace/weights \
+  -v $(pwd)/models:/workspace/models \
   -p 8080:8080 \
   nemotron-asr:cuda13-full \
   python -m nemotron_speech.server --port 8080
-```
-
-### Option 2: Standard Build
-
-For GPUs with existing PyTorch wheel support (non-Blackwell):
-
-```bash
-docker build -t nemotron-speech:latest .
-docker run --gpus all --ipc=host nemotron-speech:latest python3 -m nemotron_speech --test
 ```
 
 ## LLM Container (Nemotron-3-Nano-30B)
@@ -261,15 +251,15 @@ Both model weight directories are excluded from git due to their size. Download 
 ### ASR Model (Parakeet)
 
 ```bash
-mkdir -p weights
-# Download Parakeet_Realtime_En_600M.nemo (~2.4GB) to weights/
+mkdir -p models
+# Download Parakeet_Realtime_En_600M.nemo (~2.4GB) to models/
 # Available from NVIDIA NGC or HuggingFace
 ```
 
 ### LLM Model (Nemotron-3-Nano)
 
 ```bash
-python3 -c "
+uv run --with huggingface_hub python -c "
 from huggingface_hub import snapshot_download
 snapshot_download(
     repo_id='nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16',
@@ -290,7 +280,7 @@ The server provides real-time streaming speech recognition via WebSocket with pr
 
 ```bash
 docker run -d --name nemotron-asr --gpus all --ipc=host \
-  -v $(pwd)/weights:/workspace/weights:ro \
+  -v $(pwd)/models:/workspace/models:ro \
   -p 8080:8080 \
   nemotron-asr:cuda13-full \
   python -m nemotron_speech.server --port 8080 --right-context 1
@@ -334,23 +324,20 @@ The `--right-context` parameter controls the accuracy/latency tradeoff:
 **Basic test with test client:**
 
 ```bash
-# Install test dependencies
-pip install websockets
-
 # Run test (sends audio in 500ms chunks)
-python tests/test_websocket_client.py tests/fixtures/harvard_16k.wav ws://localhost:8080
+uv run --with websockets tests/test_websocket_client.py tests/fixtures/harvard_16k.wav ws://localhost:8080
 ```
 
 **Test with real-time streaming simulation:**
 
 ```bash
-python tests/test_websocket_client.py tests/fixtures/harvard_16k.wav ws://localhost:8080 --chunk 160
+uv run --with websockets tests/test_websocket_client.py tests/fixtures/harvard_16k.wav ws://localhost:8080 --chunk 160
 ```
 
 **Test multiple chunk sizes:**
 
 ```bash
-python tests/test_websocket_client.py tests/fixtures/harvard_16k.wav ws://localhost:8080 --all
+uv run --with websockets tests/test_websocket_client.py tests/fixtures/harvard_16k.wav ws://localhost:8080 --all
 ```
 
 ### Example Output
@@ -388,36 +375,30 @@ The `examples/` directory contains standalone Python clients for inference from 
 ### ASR Client (Audio to Text)
 
 ```bash
-# Install dependency
-pip install websockets
-
 # Transcribe an audio file
-python examples/asr_client.py audio.wav
+uv run --with websockets examples/asr_client.py audio.wav
 
 # Simulate real-time streaming
-python examples/asr_client.py audio.wav --realtime
+uv run --with websockets examples/asr_client.py audio.wav --realtime
 
 # Custom server URL
-python examples/asr_client.py audio.wav --url ws://192.168.1.100:8080
+uv run --with websockets examples/asr_client.py audio.wav --url ws://192.168.1.100:8080
 ```
 
 ### LLM Client (Text to Text)
 
 ```bash
-# Install dependency
-pip install openai
-
 # Simple query
-python examples/llm_client.py "What is the capital of France?"
+uv run --with openai examples/llm_client.py "What is the capital of France?"
 
 # Streaming output
-python examples/llm_client.py --stream "Write a poem about AI"
+uv run --with openai examples/llm_client.py --stream "Write a poem about AI"
 
 # Enable chain-of-thought reasoning
-python examples/llm_client.py --reasoning "What is 15 * 23?"
+uv run --with openai examples/llm_client.py --reasoning "What is 15 * 23?"
 
 # Custom server URL
-python examples/llm_client.py --url http://192.168.1.100:8000/v1 "Hello"
+uv run --with openai examples/llm_client.py --url http://192.168.1.100:8000/v1 "Hello"
 ```
 
 ## Testing Streaming Inference
@@ -428,7 +409,7 @@ This test validates cache-aware streaming ASR on Blackwell GPUs:
 
 ```bash
 docker run --rm --gpus all --ipc=host \
-  -v $(pwd)/weights:/workspace/weights \
+  -v $(pwd)/models:/workspace/models \
   -v $(pwd)/tests:/workspace/tests \
   nemotron-asr:cuda13-full \
   python3 /workspace/tests/test_streaming_blackwell.py
@@ -442,7 +423,7 @@ Cache-Aware Streaming ASR Test on Blackwell GPU
 GPU: NVIDIA GB10
 CUDA: 13.1
 
-Loading model: /workspace/weights/Parakeet_Reatime_En_600M.nemo
+Loading model: /workspace/models/Parakeet_Reatime_En_600M.nemo
 ...
 Streaming Inference
   Chunk 1: cache_len=2, pred_shapes=[torch.Size([0])]
@@ -460,7 +441,7 @@ SUCCESS - Cache-aware streaming inference completed!
 
 ```bash
 docker run --rm --gpus all --ipc=host \
-  -v $(pwd)/weights:/workspace/weights \
+  -v $(pwd)/models:/workspace/models \
   -v $(pwd)/tests:/workspace/tests \
   nemotron-asr:cuda13-full \
   python3 /workspace/tests/benchmark_inference.py
@@ -507,10 +488,14 @@ The model uses cache-aware streaming with:
 ## Development
 
 ```bash
-# Using uv
-uv venv
-source .venv/bin/activate
-uv pip install -e .
+# Install uv if not already installed
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create virtual environment and install dependencies
+uv sync
+
+# Or run commands directly without explicit venv activation
+uv run python -m nemotron_speech.server --help
 ```
 
 ## Project Structure
@@ -539,10 +524,9 @@ nemotron-speech/
 │   ├── benchmark_inference.py        # Performance benchmark
 │   └── fixtures/
 │       └── harvard_16k.wav           # Test audio file (16kHz)
-├── models/                           # LLM weights (not in git, ~60GB)
-│   └── NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/
-└── weights/                          # ASR weights (not in git, ~2.4GB)
-    └── Parakeet_Reatime_En_600M.nemo
+└── models/                           # Model weights (not in git, ~120GB total)
+    ├── Parakeet_Reatime_En_600M.nemo     # ASR model (~2.4GB)
+    └── NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/  # LLM model (~60GB)
 ```
 
 ## Troubleshooting

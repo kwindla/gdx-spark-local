@@ -4,7 +4,7 @@
 #
 # Prerequisites:
 #   1. Build the container: docker build -f Dockerfile.asr -t nemotron-asr:latest .
-#   2. Model weights at: weights/Parakeet_Reatime_En_600M.nemo
+#   2. Model weights at: models/Parakeet_Reatime_En_600M.nemo
 #
 # Usage:
 #   ./tests/test_streaming_asr.sh
@@ -31,7 +31,7 @@ if ! docker image inspect nemotron-asr:latest &>/dev/null; then
 fi
 
 # Check if model exists
-MODEL_PATH="$PROJECT_DIR/weights/Parakeet_Reatime_En_600M.nemo"
+MODEL_PATH="$PROJECT_DIR/models/Parakeet_Reatime_En_600M.nemo"
 if [ ! -f "$MODEL_PATH" ]; then
     echo -e "${RED}Error: Model not found at $MODEL_PATH${NC}"
     exit 1
@@ -114,7 +114,7 @@ docker run --rm --gpus all --ipc=host \
     -v "$PROJECT_DIR:/workspace" \
     nemotron-asr:latest \
     python3 /opt/nemo/examples/asr/asr_cache_aware_streaming/speech_to_text_cache_aware_streaming_infer.py \
-        model_path=/workspace/weights/Parakeet_Reatime_En_600M.nemo \
+        model_path=/workspace/models/Parakeet_Reatime_En_600M.nemo \
         dataset_manifest=/workspace/tests/fixtures/test_manifest.json \
         output_path=/workspace/tests/fixtures/output \
         batch_size=1 \

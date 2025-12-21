@@ -206,15 +206,15 @@ RUN uv pip install --no-cache \
     jinja2
 
 # Build and install vLLM
-RUN pip install --break-system-packages -e . --no-build-isolation
+RUN uv pip install --no-cache -e . --no-build-isolation
 
 # Reinstall our custom PyTorch built for sm_121 (vLLM may have replaced it)
 # Also remove torchvision/torchaudio which are incompatible with our custom PyTorch
-RUN pip uninstall -y torchvision torchaudio || true && \
-    pip install --break-system-packages --force-reinstall /tmp/pytorch_wheel/torch*.whl
+RUN uv pip uninstall torchvision torchaudio || true && \
+    uv pip install --no-cache --reinstall /tmp/pytorch_wheel/torch*.whl
 
 # Install triton and fix ptxas for sm_121a support
-RUN pip install --break-system-packages triton && \
+RUN uv pip install --no-cache triton && \
     rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
     ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas
 

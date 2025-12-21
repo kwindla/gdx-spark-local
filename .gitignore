@@ -1,5 +1,4 @@
-# Model weights and large files
-weights/
+# Model weights (download separately, ~120GB total)
 models/
 
 # Intermediate/deprecated Dockerfiles (keep only *-cuda13-build)

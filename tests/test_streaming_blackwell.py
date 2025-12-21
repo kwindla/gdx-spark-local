@@ -17,7 +17,7 @@ from omegaconf import OmegaConf
 import nemo.collections.asr as nemo_asr
 from nemo.collections.asr.parts.utils.streaming_utils import CacheAwareStreamingAudioBuffer
 
-MODEL_PATH = "/workspace/weights/Parakeet_Reatime_En_600M.nemo"
+MODEL_PATH = "/workspace/models/Parakeet_Reatime_En_600M.nemo"
 AUDIO_PATH = "/workspace/tests/fixtures/harvard_16k.wav"
 
 

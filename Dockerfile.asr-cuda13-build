@@ -10,7 +10,7 @@
 #
 # Run:
 #   docker run --rm --gpus all --ipc=host \
-#     -v $(pwd)/weights:/workspace/weights \
+#     -v $(pwd)/models:/workspace/models \
 #     -p 8080:8080 \
 #     nemotron-asr:cuda13-full \
 #     python -m nemotron_speech.server --port 8080
