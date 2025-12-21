@@ -108,7 +108,7 @@ docker run -d \
                  --max-num-seqs 1 \
                  --max-num-batched-tokens 2048 \
                  --scheduling-policy fcfs \
-                 --max-model-len 4096 \
+                 --max-model-len 100000 \
                  --enforce-eager \
                  --disable-log-requests \
                  --enable-auto-tool-choice \
@@ -125,7 +125,7 @@ The reasoning parser (`nano_v3_reasoning_parser.py`) enables structured reasonin
 |----------|-------|---------|
 | `--gpu-memory-utilization 0.60` | 0.60 | Use 60% of GPU memory (~72GB), leaving room for ASR |
 | `--max-num-seqs 1` | 1 | Single request at a time (optimized for latency) |
-| `--max-model-len 4096` | 4K | Maximum context length (reduced to minimize KV cache) |
+| `--max-model-len 100000` | 100K | Maximum context length for multi-turn conversations |
 | `--enforce-eager` | - | Required for sm_121a compatibility |
 | `--swap-space 0` | 0 | Disable CPU swap for consistent latency |
 | `--reasoning-parser nano_v3` | nano_v3 | Use NVIDIA's reasoning parser for structured output |
@@ -229,7 +229,7 @@ The DGX Spark has 128GB unified memory. vLLM pre-allocates GPU memory for KV cac
 
 | Container | Memory Budget | Key Settings |
 |-----------|--------------|--------------|
-| LLM (vLLM) | ~72 GB | `--gpu-memory-utilization 0.60 --max-model-len 4096` |
+| LLM (vLLM) | ~72 GB | `--gpu-memory-utilization 0.60 --max-model-len 100000` |
 | ASR (NeMo) | ~3 GB | Load to CPU first, then move to GPU |
 | Free | ~45 GB | Available for inference |
 
@@ -240,9 +240,11 @@ The DGX Spark has 128GB unified memory. vLLM pre-allocates GPU memory for KV cac
 - Reduce `--max-model-len` to minimize KV cache size if memory is tight
 
 Adjust based on your needs:
-- `0.60` + `max-model-len 4096` = ~72GB for LLM, ~48GB free (tested working)
-- `0.65` + `max-model-len 8192` = ~78GB for LLM, larger context window
+- `0.60` + `max-model-len 100000` = ~72GB for LLM, ~48GB free (tested working)
+- `0.70` + `max-model-len 100000` = ~84GB for LLM, more KV cache headroom
 - Lower utilization will fail: model weights alone need ~60GB
+
+The model natively supports up to 262K tokens. The KV cache at 0.60 utilization can handle ~408K tokens, so 100K context is well within capacity.
 
 ## Model Weights
 
@@ -585,12 +587,14 @@ ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/b
 
 ### vLLM Out of Memory
 
-If the LLM container fails with OOM errors, reduce memory utilization:
+If the LLM container fails with OOM errors, reduce memory utilization or context length:
 
 ```bash
 --gpu-memory-utilization 0.55  # Use less memory
---max-model-len 16384          # Reduce max context length
+--max-model-len 32000          # Reduce max context length
 ```
+
+Note: The model weights require ~60GB minimum. Setting utilization below 0.55 will fail.
 
 ## License
 
