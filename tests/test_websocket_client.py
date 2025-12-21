@@ -100,8 +100,8 @@ async def test_asr_streaming(
             total_sent += len(chunk)
             chunks_sent += 1
 
-            # Simulate real-time streaming (optional - comment out for max speed)
-            # await asyncio.sleep(chunk_ms / 1000)
+            # Simulate real-time streaming
+            await asyncio.sleep(chunk_ms / 1000)
 
         send_time = time.time()
         print(f"  Sent {chunks_sent} chunks ({total_sent} bytes) in {(send_time - send_start)*1000:.0f}ms")
