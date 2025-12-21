@@ -1,0 +1,270 @@
+# Dockerfile.asr-cuda13-build - ASR container with PyTorch built from source for CUDA 13.1/sm_121
+#
+# Purpose: Full sm_121 (GB10/DGX Spark) support with PyTorch built from source
+# Base: CUDA 13.1.0 devel
+# PyTorch: Built from source with TORCH_CUDA_ARCH_LIST=12.1
+# NeMo: r2.6.0 from source
+#
+# Build (takes 1-2 hours):
+#   docker build -f Dockerfile.asr-cuda13-build -t nemotron-asr:cuda13-full .
+#
+# Run:
+#   docker run --rm --gpus all --ipc=host \
+#     -v $(pwd)/weights:/workspace/weights \
+#     -p 8080:8080 \
+#     nemotron-asr:cuda13-full \
+#     python -m nemotron_speech.server --port 8080
+
+FROM nvidia/cuda:13.1.0-devel-ubuntu24.04
+
+LABEL maintainer="nemotron-speech"
+LABEL description="ASR container with PyTorch built from source for CUDA 13.1 sm_121"
+LABEL version="3.0"
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# =============================================================================
+# System Dependencies
+# =============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3-pip \
+    git \
+    curl \
+    wget \
+    cmake \
+    ninja-build \
+    ccache \
+    libopenblas-dev \
+    libomp-dev \
+    libffi-dev \
+    libssl-dev \
+    ffmpeg \
+    sox \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3 /usr/bin/python
+
+# Install uv for fast package management
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+ENV UV_SYSTEM_PYTHON=1
+ENV UV_BREAK_SYSTEM_PACKAGES=1
+
+# =============================================================================
+# cuDNN Installation (required for PyTorch CUDA)
+# =============================================================================
+# Copy cuDNN from NGC PyTorch container (pre-built for this CUDA version)
+COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/lib/aarch64-linux-gnu/libcudnn* /usr/lib/aarch64-linux-gnu/
+COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/include/cudnn* /usr/include/
+
+# =============================================================================
+# NCCL Libraries (required for PyTorch distributed/NeMo)
+# =============================================================================
+# Copy NCCL libraries and headers from NGC container
+COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/lib/aarch64-linux-gnu/libnccl* /usr/lib/aarch64-linux-gnu/
+COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/include/nccl.h /usr/include/
+COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/include/nccl_device.h /usr/include/
+COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/include/nccl_device/ /usr/include/nccl_device/
+
+# Verify NCCL is properly installed
+RUN echo "=== Verifying NCCL installation ===" && \
+    ls -la /usr/lib/aarch64-linux-gnu/libnccl* && \
+    ls -la /usr/include/nccl.h && \
+    ls -la /usr/include/nccl_device/ && \
+    ldconfig
+
+# =============================================================================
+# PyTorch Build Dependencies
+# =============================================================================
+RUN uv pip install --no-cache \
+    numpy \
+    pyyaml \
+    typing_extensions \
+    sympy \
+    filelock \
+    networkx \
+    jinja2 \
+    fsspec \
+    packaging \
+    setuptools \
+    wheel \
+    cffi \
+    future \
+    requests \
+    dataclasses \
+    pillow \
+    expecttest \
+    hypothesis \
+    pytest
+
+# =============================================================================
+# Build PyTorch from Source
+# =============================================================================
+# Cache buster - increment to force PyTorch rebuild with new settings
+ARG PYTORCH_CACHE_BUSTER=v2-nccl
+
+WORKDIR /build
+
+# Clone PyTorch main branch (needed for CUDA 13.1 compatibility)
+RUN git clone --recursive --depth 1 https://github.com/pytorch/pytorch.git
+
+WORKDIR /build/pytorch
+
+# Update submodules
+RUN git submodule sync && git submodule update --init --recursive --depth 1
+
+# Set build environment for sm_121 (GB10)
+ENV TORCH_CUDA_ARCH_LIST="12.1"
+ENV USE_CUDA=1
+ENV USE_CUDNN=1
+ENV USE_MKLDNN=1
+# Enable distributed with NCCL (required by NeMo)
+ENV USE_DISTRIBUTED=1
+ENV USE_NCCL=1
+ENV USE_TENSORPIPE=0
+ENV USE_SYSTEM_NCCL=1
+ENV NCCL_ROOT=/usr
+ENV NCCL_LIB_DIR=/usr/lib/aarch64-linux-gnu
+ENV NCCL_INCLUDE_DIR=/usr/include
+ENV BUILD_TEST=0
+ENV MAX_JOBS=8
+ENV CMAKE_BUILD_TYPE=Release
+ENV CUDNN_LIB_DIR=/usr/lib/aarch64-linux-gnu
+ENV CUDNN_INCLUDE_DIR=/usr/include
+ENV USE_PRIORITIZED_TEXT_FOR_LD=1
+
+# Create symlinks for CUB/Thrust from CCCL (CUDA 13.1 layout)
+# CCCL structure: /usr/local/cuda/include/cccl/cub/cub.cuh
+# PyTorch looks for: <CUB_INCLUDE_DIR>/cub/cub.cuh
+# So we set CUB_INCLUDE_DIR=/usr/local/cuda/include/cccl
+# And also create symlinks for compatibility
+RUN ln -sf /usr/local/cuda/include/cccl/cub /usr/local/cuda/include/cub && \
+    ln -sf /usr/local/cuda/include/cccl/thrust /usr/local/cuda/include/thrust && \
+    echo "=== Verifying CUB access ===" && \
+    ls /usr/local/cuda/include/cub/cub.cuh && \
+    ls /usr/local/cuda/include/cccl/cub/cub.cuh
+
+# Build and install PyTorch
+# Set CUB_INCLUDE_DIR to CCCL directory so cmake finds cub/cub.cuh
+ENV CUB_INCLUDE_DIR=/usr/local/cuda/include/cccl
+RUN python3 setup.py bdist_wheel && \
+    uv pip install --no-cache dist/*.whl
+
+# =============================================================================
+# Build torchaudio from Source
+# =============================================================================
+WORKDIR /build
+
+RUN git clone --recursive --depth 1 https://github.com/pytorch/audio.git
+
+WORKDIR /build/audio
+
+ENV BUILD_SOX=0
+ENV USE_CUDA=1
+
+RUN python3 setup.py bdist_wheel && \
+    uv pip install --no-cache dist/*.whl
+
+# =============================================================================
+# Cleanup build artifacts to reduce image size
+# =============================================================================
+WORKDIR /workspace
+RUN rm -rf /build
+
+# =============================================================================
+# NeMo Installation from Source (r2.6.0)
+# =============================================================================
+RUN git clone --depth 1 --branch r2.6.0 https://github.com/NVIDIA/NeMo.git /opt/nemo
+
+# Install NeMo ASR dependencies
+RUN uv pip install --no-cache \
+    Cython \
+    hydra-core>=1.3.0 \
+    omegaconf>=2.3 \
+    pytorch-lightning>=2.0 \
+    torchmetrics>=0.11.0 \
+    transformers>=4.36.0 \
+    sentencepiece \
+    webdataset \
+    lhotse>=1.20.0 \
+    braceexpand \
+    editdistance \
+    g2p_en \
+    inflect \
+    kaldi-python-io \
+    kaldiio \
+    librosa>=0.10.0 \
+    marshmallow \
+    ruamel.yaml \
+    soundfile \
+    text-unidecode \
+    numba
+
+# Install NeMo from source
+RUN cd /opt/nemo && uv pip install --no-cache -e ".[asr]"
+
+# =============================================================================
+# Patch NeMo NVRTC to use correct GPU architecture
+# =============================================================================
+RUN sed -i 's/opts = \[\]/opts = [f"--gpu-architecture=compute_{torch.cuda.get_device_capability(0)[0]*10+torch.cuda.get_device_capability(0)[1]}".encode()] if torch.cuda.is_available() else []/' \
+    /opt/nemo/nemo/core/utils/cuda_python_utils.py || true
+
+# Add dynamic architecture detection patch
+COPY <<'EOF' /tmp/patch_nvrtc.py
+import re
+
+with open('/opt/nemo/nemo/core/utils/cuda_python_utils.py', 'r') as f:
+    content = f.read()
+
+# Find and replace the opts = [] pattern
+old_pattern = r'(\s+)opts = \[\]\n(\s+)\(err,\) = nvrtc\.nvrtcCompileProgram'
+new_code = r'''\1# Detect GPU architecture for sm_121 (GB10) support
+\1import torch
+\1if torch.cuda.is_available():
+\1    major, minor = torch.cuda.get_device_capability(0)
+\1    arch = major * 10 + minor
+\1    opts = [f"--gpu-architecture=compute_{arch}".encode()]
+\1else:
+\1    opts = []
+\2(err,) = nvrtc.nvrtcCompileProgram'''
+
+content = re.sub(old_pattern, new_code, content)
+
+with open('/opt/nemo/nemo/core/utils/cuda_python_utils.py', 'w') as f:
+    f.write(content)
+
+print("NeMo NVRTC patched for dynamic GPU architecture detection")
+EOF
+RUN python3 /tmp/patch_nvrtc.py || echo "Patch may have already been applied"
+
+# =============================================================================
+# Application Dependencies
+# =============================================================================
+RUN uv pip install --no-cache \
+    websockets>=12.0 \
+    loguru>=0.7.0
+
+# =============================================================================
+# Application Code
+# =============================================================================
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+RUN uv pip install --no-cache -e .
+
+# =============================================================================
+# Environment
+# =============================================================================
+ENV PYTHONUNBUFFERED=1
+ENV NEMO_CACHE_DIR=/workspace/.nemo_cache
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python -c "import websockets; print('ok')" || exit 1
+
+CMD ["python", "-m", "nemotron_speech.server", "--port", "8080"]
