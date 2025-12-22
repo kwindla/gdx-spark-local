@@ -1,8 +1,9 @@
 # Nemotron-Speech
 
-Streaming Speech-to-Text and LLM inference services for NVIDIA DGX Spark (Blackwell GB10).
+Streaming Speech-to-Text, Text-to-Speech, and LLM inference services for NVIDIA DGX Spark (Blackwell GB10).
 
 - **ASR**: Streaming Speech-to-Text using NVIDIA's Parakeet ASR model with NeMo
+- **TTS**: Text-to-Speech using NVIDIA Magpie TTS NIM
 - **LLM**: Nemotron-3-Nano-30B inference using vLLM with OpenAI-compatible API
 
 ## Quick Start
@@ -114,10 +115,26 @@ docker run -d \
                  --enable-auto-tool-choice \
                  --tool-call-parser qwen3_coder \
                  --reasoning-parser-plugin /workspace/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/nano_v3_reasoning_parser.py \
-                 --reasoning-parser nano_v3"
+                 --reasoning-parser nano_v3 \
+                 --enable-prefix-caching"
 ```
 
 The reasoning parser (`nano_v3_reasoning_parser.py`) enables structured reasoning output. We use a patched version that fixes streaming behavior when `enable_thinking: false` (the upstream version incorrectly routes content to `reasoning_content` in streaming mode).
+
+#### Prefix Caching
+
+Prefix caching reduces Time-To-First-Token (TTFT) by caching the KV cache for common prefixes like system prompts. When subsequent requests share the same prefix, the cached values are reused instead of recomputing.
+
+**Note:** Nemotron-3-Nano uses a hybrid Mamba-Transformer architecture. vLLM's prefix caching support for Mamba layers is experimental but functional.
+
+**Observed behavior (DGX Spark):**
+
+| Prompt Size | First Request TTFT | Cached Request TTFT | Improvement |
+|-------------|-------------------|---------------------|-------------|
+| Short (~200 tokens) | ~210ms | ~210ms | None |
+| Medium (~1000 tokens) | ~610ms | ~420ms | ~30% |
+
+For multi-turn conversations with the same system prompt, you should see reduced TTFT after the first request.
 
 #### Key Arguments Explained
 
@@ -130,6 +147,7 @@ The reasoning parser (`nano_v3_reasoning_parser.py`) enables structured reasonin
 | `--swap-space 0` | 0 | Disable CPU swap for consistent latency |
 | `--reasoning-parser nano_v3` | nano_v3 | Use NVIDIA's reasoning parser for structured output |
 | `--enable-auto-tool-choice` | - | Enable tool/function calling support |
+| `--enable-prefix-caching` | - | Cache common prefixes (system prompts) to reduce TTFT |
 
 ### Test the Endpoint
 
@@ -245,6 +263,80 @@ Adjust based on your needs:
 - Lower utilization will fail: model weights alone need ~60GB
 
 The model natively supports up to 262K tokens. The KV cache at 0.60 utilization can handle ~408K tokens, so 100K context is well within capacity.
+
+## TTS Container (Magpie TTS NIM)
+
+The Magpie TTS NIM provides high-quality multilingual text-to-speech synthesis.
+
+### Run the TTS Server
+
+```bash
+docker run -d \
+    --name magpie-tts \
+    --gpus all \
+    --shm-size=8g \
+    --restart unless-stopped \
+    -p 50051:50051 \
+    -e NGC_API_KEY=$NGC_API_KEY \
+    nvcr.io/nim/nvidia/magpie-tts-multilingual:latest
+```
+
+**Note:** The container takes up to 30 minutes to initialize on first run while it downloads and optimizes model weights.
+
+### Test the Endpoint
+
+```bash
+# Using the Riva Python client
+uv run python -c "
+import riva.client
+auth = riva.client.Auth(uri='localhost:50051', use_ssl=False)
+service = riva.client.SpeechSynthesisService(auth)
+for resp in service.synthesize_online('Hello, world!', 'Magpie-Multilingual.EN-US.Aria', 'en-US'):
+    print(f'Received {len(resp.audio)} bytes')
+"
+```
+
+### Available Voices
+
+| Voice ID | Language | Description |
+|----------|----------|-------------|
+| `Magpie-Multilingual.EN-US.Aria` | English (US) | Female voice |
+| `Magpie-Multilingual.ES-US.Aria` | Spanish (US) | Female voice |
+| `Magpie-Multilingual.FR-FR.Aria` | French | Female voice |
+| `Magpie-Multilingual.DE-DE.Aria` | German | Female voice |
+| `Magpie-Multilingual.ZH-CN.Aria` | Mandarin | Female voice |
+
+### Known Issue: Incomplete Audio on DGX Spark
+
+**⚠️ There is a documented bug affecting Magpie TTS on DGX Spark.**
+
+From the [NVIDIA NIM Riva TTS Release Notes](https://docs.nvidia.com/nim/riva/tts/latest/release-notes.html):
+
+> "The model may return partial audio for short utterances (one word texts) and **incomplete audio on DGX Spark platform**."
+
+**Symptoms:**
+- TTS returns truncated audio (e.g., 400ms for a sentence that should be 3+ seconds)
+- Server logs show correct `total_characters` but short `audio_duration`
+- Truncation is intermittent and unpredictable
+
+**Workaround:**
+
+Our `pipecat_bots/riva_local_tts.py` implementation includes:
+
+1. **Unicode normalization** - Replace curly quotes/dashes that cause `character_mapping` errors:
+   ```python
+   text = text.replace("\u2019", "'")  # Curly apostrophe → straight
+   text = text.replace("\u2014", "-")  # Em dash → hyphen
+   ```
+
+2. **Retry logic** - Detect truncated audio and retry up to 3 times:
+   ```python
+   # If audio is too short for text length, retry
+   if bytes_per_char < 1500:  # ~30ms per character minimum
+       retry...
+   ```
+
+**Status:** This is an NVIDIA server-side bug with no user-configurable workaround. As of NIM version 1.10.0 (December 2025), the issue persists.
 
 ## Model Weights
 
