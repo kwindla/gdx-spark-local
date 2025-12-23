@@ -1,14 +1,18 @@
-# Dockerfile.asr-cuda13-build - ASR container with PyTorch built from source for CUDA 13.1/sm_121
+# Dockerfile.asr-cuda13-build - ASR + TTS container with PyTorch built from source for CUDA 13.1/sm_121
 #
 # Purpose: Full sm_121 (GB10/DGX Spark) support with PyTorch built from source
 # Base: CUDA 13.1.0 devel
 # PyTorch: Built from source with TORCH_CUDA_ARCH_LIST=12.1
-# NeMo: r2.6.0 from source
+# NeMo: main branch (pinned commit) with ASR + TTS support
+#
+# Models supported:
+#   - ASR: Parakeet streaming ASR (NeMo)
+#   - TTS: Magpie TTS multilingual (NeMo, requires main branch)
 #
 # Build (takes 1-2 hours):
 #   docker build -f Dockerfile.asr-cuda13-build -t nemotron-asr:cuda13-full .
 #
-# Run:
+# Run ASR server:
 #   docker run --rm --gpus all --ipc=host \
 #     -v $(pwd)/models:/workspace/models \
 #     -p 8080:8080 \
@@ -18,8 +22,8 @@
 FROM nvidia/cuda:13.1.0-devel-ubuntu24.04
 
 LABEL maintainer="nemotron-speech"
-LABEL description="ASR container with PyTorch built from source for CUDA 13.1 sm_121"
-LABEL version="3.0"
+LABEL description="ASR + TTS container with PyTorch built from source for CUDA 13.1 sm_121"
+LABEL version="4.0"
 
 # Prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -176,11 +180,15 @@ WORKDIR /workspace
 RUN rm -rf /build
 
 # =============================================================================
-# NeMo Installation from Source (r2.6.0)
+# NeMo Installation from Source (main branch for MagpieTTS support)
 # =============================================================================
-RUN git clone --depth 1 --branch r2.6.0 https://github.com/NVIDIA/NeMo.git /opt/nemo
+# Pin to specific commit for reproducibility (2025-12-22)
+# MagpieTTSModel requires main branch (not in r2.6.0 release)
+ARG NEMO_COMMIT=661af02e105662bd5b61881054608ea44944572c
+RUN git clone https://github.com/NVIDIA/NeMo.git /opt/nemo && \
+    cd /opt/nemo && git checkout ${NEMO_COMMIT}
 
-# Install NeMo ASR dependencies
+# Install NeMo ASR + TTS dependencies
 RUN uv pip install --no-cache \
     Cython \
     hydra-core>=1.3.0 \
@@ -202,10 +210,11 @@ RUN uv pip install --no-cache \
     ruamel.yaml \
     soundfile \
     text-unidecode \
-    numba
+    numba \
+    kaldialign
 
-# Install NeMo from source
-RUN cd /opt/nemo && uv pip install --no-cache -e ".[asr]"
+# Install NeMo from source with ASR and TTS support
+RUN cd /opt/nemo && uv pip install --no-cache -e ".[asr,tts]"
 
 # =============================================================================
 # Patch NeMo NVRTC to use correct GPU architecture

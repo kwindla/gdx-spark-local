@@ -3,7 +3,7 @@
 Streaming Speech-to-Text, Text-to-Speech, and LLM inference services for NVIDIA DGX Spark (Blackwell GB10).
 
 - **ASR**: Streaming Speech-to-Text using NVIDIA's Parakeet ASR model with NeMo
-- **TTS**: Text-to-Speech using NVIDIA Magpie TTS NIM
+- **TTS**: Text-to-Speech using open-source NVIDIA Magpie TTS (357M) with NeMo
 - **LLM**: Nemotron-3-Nano-30B inference using vLLM with OpenAI-compatible API
 
 ## Quick Start
@@ -16,21 +16,24 @@ cd nemotron-speech
 # 2. Download model weights (see "Model Weights" section for details)
 #    - ASR: models/Parakeet_Reatime_En_600M.nemo (~2.4GB)
 #    - LLM: models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/ (~60GB)
+#    - TTS: Downloaded automatically from HuggingFace on first run
 
 # 3. Build containers (takes 1-3 hours each due to PyTorch compilation)
 docker build -f Dockerfile.asr-cuda13-build -t nemotron-asr:cuda13-full .
 docker build -f Dockerfile.vllm-cuda13-build -t vllm:cuda13-full .
 
-# 4. Start ASR server (port 8080)
+# 4. Start combined ASR + TTS server (ports 8080 and 8001)
 docker run -d --name nemotron-asr --gpus all --ipc=host \
-  -v $(pwd)/models:/workspace/models:ro -p 8080:8080 \
-  nemotron-asr:cuda13-full python -m nemotron_speech.server --port 8080
+  -v $(pwd):/workspace \
+  -p 8080:8080 -p 8001:8001 \
+  -e HUGGINGFACE_ACCESS_TOKEN=$HUGGINGFACE_ACCESS_TOKEN \
+  nemotron-asr:cuda13-full \
+  bash /workspace/scripts/start_asr_tts.sh
 
-# 5. Start LLM server (port 8000) - see README for full command
+# 5. Start LLM server (port 8000) - see LLM section for full command
 
-# 6. Test from host (using uv)
-uv run --with websockets examples/asr_client.py tests/fixtures/harvard_16k.wav
-uv run --with openai examples/llm_client.py "Hello, who are you?"
+# 6. Run the Pipecat voice bot
+uv run pipecat_bots/bot.py
 ```
 
 ## Requirements
@@ -38,23 +41,235 @@ uv run --with openai examples/llm_client.py "Hello, who are you?"
 - NVIDIA DGX Spark (ARM64/Blackwell GB10) or compatible NVIDIA GPU
 - Docker with NVIDIA Container Toolkit
 - CUDA 13.0+ (for Blackwell/sm_121 support)
+- HuggingFace account with access to `nvidia/magpie_tts_multilingual_357m`
 
-## Container Options
+## Architecture
 
-### Option 1: CUDA 13.1 Build (Recommended for Blackwell/DGX Spark)
+The system runs three services that communicate over the network:
 
-This container builds PyTorch from source with full CUDA 13.1 and sm_121 support. Required for cache-aware streaming inference on Blackwell GPUs.
+```
+Host (uv run pipecat_bots/bot.py)
+    ├─→ ASR:  ws://localhost:8080      (WebSocket, Parakeet 600M)
+    ├─→ LLM:  http://localhost:8000/v1 (HTTP, Nemotron-3-Nano-30B)
+    └─→ TTS:  http://localhost:8001/v1 (HTTP, Magpie TTS 357M)
+
+┌─────────────────────────────────────────────────┐
+│  nemotron-asr container (shared CUDA context)   │
+│  ├─ ASR server (port 8080) - ~3GB VRAM          │
+│  └─ TTS server (port 8001) - ~2GB VRAM          │
+└─────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────┐
+│  vllm-nemotron container                        │
+│  └─ LLM server (port 8000) - ~72GB VRAM         │
+└─────────────────────────────────────────────────┘
+```
+
+ASR and TTS run in the same container to share a single CUDA context, avoiding memory fragmentation when running alongside the memory-hungry LLM.
+
+## ASR + TTS Container
+
+This container provides both streaming ASR and TTS services. It builds PyTorch and NeMo from source with full CUDA 13.1 and sm_121 support for Blackwell GPUs.
+
+### Build the Container
 
 ```bash
 # Build (takes 1-2 hours due to PyTorch compilation)
 docker build -f Dockerfile.asr-cuda13-build -t nemotron-asr:cuda13-full .
+```
 
-# Run the ASR server
-docker run --rm --gpus all --ipc=host \
-  -v $(pwd)/models:/workspace/models \
-  -p 8080:8080 \
+### Run the Combined Server
+
+```bash
+docker run -d --name nemotron-asr --gpus all --ipc=host \
+  -v $(pwd):/workspace \
+  -p 8080:8080 -p 8001:8001 \
+  -e HUGGINGFACE_ACCESS_TOKEN=$HUGGINGFACE_ACCESS_TOKEN \
   nemotron-asr:cuda13-full \
-  python -m nemotron_speech.server --port 8080
+  bash /workspace/scripts/start_asr_tts.sh
+```
+
+This starts both servers:
+- **ASR**: WebSocket server on port 8080
+- **TTS**: HTTP server on port 8001
+
+### Test the Endpoints
+
+```bash
+# Check TTS health
+curl http://localhost:8001/health
+
+# Get TTS configuration (sample rate, voices, languages)
+curl http://localhost:8001/v1/audio/config
+
+# Synthesize speech (returns raw PCM audio)
+curl -X POST http://localhost:8001/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"input": "Hello, world!", "voice": "aria", "language": "en"}' \
+  --output hello.pcm
+
+# Play the audio (22kHz, 16-bit, mono)
+ffplay -f s16le -ar 22000 -ac 1 hello.pcm
+```
+
+### Container Management
+
+```bash
+# View logs
+docker logs -f nemotron-asr
+
+# Stop the container
+docker stop nemotron-asr
+
+# Start again
+docker start nemotron-asr
+
+# Remove container
+docker rm -f nemotron-asr
+```
+
+## TTS Server (Open-Source Magpie TTS)
+
+The TTS server uses NVIDIA's open-source Magpie TTS model for high-quality multilingual speech synthesis. Unlike the Magpie TTS NIM, this runs the model directly via NeMo, avoiding the audio truncation bugs that affect the NIM on DGX Spark.
+
+### Model Specifications
+
+| Attribute | Value |
+|-----------|-------|
+| Model ID | `nvidia/magpie_tts_multilingual_357m` |
+| Parameters | 357M |
+| Codec | `nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps` |
+| Sample Rate | 22kHz |
+| License | [NVIDIA Open Model License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/) (commercial OK) |
+
+### Available Voices
+
+| Voice | Speaker Index | Description |
+|-------|---------------|-------------|
+| `john` | 0 | Male voice |
+| `sofia` | 1 | Female voice |
+| `aria` | 2 | Female voice (default) |
+| `jason` | 3 | Male voice |
+| `leo` | 4 | Male voice |
+
+### Supported Languages
+
+| Code | Language |
+|------|----------|
+| `en` | English |
+| `es` | Spanish |
+| `de` | German |
+| `fr` | French |
+| `vi` | Vietnamese |
+| `it` | Italian |
+| `zh` | Mandarin Chinese |
+
+### HTTP API
+
+The TTS server exposes an OpenAI-compatible API:
+
+**POST /v1/audio/speech**
+
+```json
+{
+  "input": "Text to synthesize",
+  "voice": "aria",
+  "language": "en",
+  "response_format": "pcm"
+}
+```
+
+Returns raw PCM audio (16-bit signed, mono, 22kHz) with headers:
+- `X-Sample-Rate`: 22000
+- `X-Channels`: 1
+- `X-Duration-Ms`: audio duration in milliseconds
+
+**GET /health**
+
+Returns server health status and model loading state.
+
+**GET /v1/audio/config**
+
+Returns TTS configuration (sample rate, available voices, languages).
+
+### Performance (DGX Spark)
+
+| Metric | Value |
+|--------|-------|
+| Model Load Time | ~52s (includes codec download) |
+| Warm-up Latency | ~230ms |
+| Average Latency | ~800ms |
+| Real-time Factor | 0.29x (3.4x faster than real-time) |
+
+### NeMo Version Requirement
+
+The Magpie TTS model requires **NeMo main branch** (not the r2.6.0 release). The `MagpieTTSModel` class only exists in the main branch. The Dockerfile pins to a specific commit for reproducibility:
+
+```dockerfile
+ARG NEMO_COMMIT=661af02e105662bd5b61881054608ea44944572c
+```
+
+### Why Open-Source Instead of NIM?
+
+| Aspect | Magpie NIM | Open-Source Magpie |
+|--------|------------|-------------------|
+| DGX Spark Support | Buggy (audio truncation) | Works correctly |
+| Dependencies | Separate container, gRPC | Same container as ASR |
+| Latency | Network + inference | Inference only |
+| Control | Black box | Full control, debuggable |
+| Memory | Separate CUDA context | Shared with ASR |
+
+## Pipecat Voice Bot
+
+The `pipecat_bots/` directory contains a complete voice bot that uses all three services.
+
+### Run the Bot
+
+```bash
+# Start the bot (requires ASR, TTS, and LLM containers running)
+uv run pipecat_bots/bot.py
+```
+
+Open `http://localhost:7860/client` in your browser to start a conversation.
+
+### Configuration
+
+The bot reads configuration from environment variables (or `.env` file):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NVIDIA_ASR_URL` | `ws://localhost:8080` | ASR WebSocket server |
+| `NVIDIA_LLM_URL` | `http://localhost:8000/v1` | LLM API server |
+| `NVIDIA_TTS_URL` | `http://localhost:8001` | TTS HTTP server |
+| `USE_LOCAL_TTS` | `true` | Use Magpie TTS (false = Cartesia cloud) |
+
+### Pipecat Services
+
+**MagpieHTTPTTSService** (`pipecat_bots/magpie_http_tts.py`)
+
+HTTP client that connects to the Magpie TTS server. Runs on the host without NeMo/PyTorch dependencies.
+
+```python
+from magpie_http_tts import MagpieHTTPTTSService
+
+tts = MagpieHTTPTTSService(
+    server_url="http://localhost:8001",
+    voice="aria",
+    language="en",
+)
+```
+
+**NVidiaWebSocketSTTService** (`pipecat_bots/nvidia_stt.py`)
+
+WebSocket client for the streaming ASR server.
+
+```python
+from nvidia_stt import NVidiaWebSocketSTTService
+
+stt = NVidiaWebSocketSTTService(
+    url="ws://localhost:8080",
+    sample_rate=16000,
+)
 ```
 
 ## LLM Container (Nemotron-3-Nano-30B)
@@ -140,7 +355,7 @@ For multi-turn conversations with the same system prompt, you should see reduced
 
 | Argument | Value | Purpose |
 |----------|-------|---------|
-| `--gpu-memory-utilization 0.60` | 0.60 | Use 60% of GPU memory (~72GB), leaving room for ASR |
+| `--gpu-memory-utilization 0.60` | 0.60 | Use 60% of GPU memory (~72GB), leaving room for ASR/TTS |
 | `--max-num-seqs 1` | 1 | Single request at a time (optimized for latency) |
 | `--max-model-len 100000` | 100K | Maximum context length for multi-turn conversations |
 | `--enforce-eager` | - | Required for sm_121a compatibility |
@@ -239,108 +454,33 @@ docker start vllm-nemotron
 docker rm -f vllm-nemotron
 ```
 
-### Memory Allocation for Running Both Containers
+## Memory Allocation
 
-The DGX Spark has 128GB unified memory. vLLM pre-allocates GPU memory for KV cache, so careful tuning is required to run both ASR and LLM simultaneously.
+The DGX Spark has 128GB unified memory. vLLM pre-allocates GPU memory for KV cache, so careful tuning is required to run all services simultaneously.
 
-**Recommended settings for running both:**
+**Recommended settings:**
 
 | Container | Memory Budget | Key Settings |
 |-----------|--------------|--------------|
 | LLM (vLLM) | ~72 GB | `--gpu-memory-utilization 0.60 --max-model-len 100000` |
-| ASR (NeMo) | ~3 GB | Load to CPU first, then move to GPU |
+| ASR (Parakeet) | ~3 GB | Load to CPU first, then move to GPU |
+| TTS (Magpie) | ~2 GB | Shares CUDA context with ASR |
 | Free | ~45 GB | Available for inference |
 
 **Important notes:**
 - vLLM's `--gpu-memory-utilization` controls total GPU allocation (model + KV cache)
-- The model weights alone consume ~60GB; set utilization high enough to fit them plus KV cache
-- ASR must load to CPU first (`map_location='cpu'`) then move to GPU to avoid OOM
-- Reduce `--max-model-len` to minimize KV cache size if memory is tight
+- The LLM model weights alone consume ~60GB; set utilization high enough for weights plus KV cache
+- ASR and TTS run in the same container to share a CUDA context
+- Running TTS in a separate container causes OOM due to CUDA context overhead
 
 Adjust based on your needs:
 - `0.60` + `max-model-len 100000` = ~72GB for LLM, ~48GB free (tested working)
 - `0.70` + `max-model-len 100000` = ~84GB for LLM, more KV cache headroom
 - Lower utilization will fail: model weights alone need ~60GB
 
-The model natively supports up to 262K tokens. The KV cache at 0.60 utilization can handle ~408K tokens, so 100K context is well within capacity.
-
-## TTS Container (Magpie TTS NIM)
-
-The Magpie TTS NIM provides high-quality multilingual text-to-speech synthesis.
-
-### Run the TTS Server
-
-```bash
-docker run -d \
-    --name magpie-tts \
-    --gpus all \
-    --shm-size=8g \
-    --restart unless-stopped \
-    -p 50051:50051 \
-    -e NGC_API_KEY=$NGC_API_KEY \
-    nvcr.io/nim/nvidia/magpie-tts-multilingual:latest
-```
-
-**Note:** The container takes up to 30 minutes to initialize on first run while it downloads and optimizes model weights.
-
-### Test the Endpoint
-
-```bash
-# Using the Riva Python client
-uv run python -c "
-import riva.client
-auth = riva.client.Auth(uri='localhost:50051', use_ssl=False)
-service = riva.client.SpeechSynthesisService(auth)
-for resp in service.synthesize_online('Hello, world!', 'Magpie-Multilingual.EN-US.Aria', 'en-US'):
-    print(f'Received {len(resp.audio)} bytes')
-"
-```
-
-### Available Voices
-
-| Voice ID | Language | Description |
-|----------|----------|-------------|
-| `Magpie-Multilingual.EN-US.Aria` | English (US) | Female voice |
-| `Magpie-Multilingual.ES-US.Aria` | Spanish (US) | Female voice |
-| `Magpie-Multilingual.FR-FR.Aria` | French | Female voice |
-| `Magpie-Multilingual.DE-DE.Aria` | German | Female voice |
-| `Magpie-Multilingual.ZH-CN.Aria` | Mandarin | Female voice |
-
-### Known Issue: Incomplete Audio on DGX Spark
-
-**⚠️ There is a documented bug affecting Magpie TTS on DGX Spark.**
-
-From the [NVIDIA NIM Riva TTS Release Notes](https://docs.nvidia.com/nim/riva/tts/latest/release-notes.html):
-
-> "The model may return partial audio for short utterances (one word texts) and **incomplete audio on DGX Spark platform**."
-
-**Symptoms:**
-- TTS returns truncated audio (e.g., 400ms for a sentence that should be 3+ seconds)
-- Server logs show correct `total_characters` but short `audio_duration`
-- Truncation is intermittent and unpredictable
-
-**Workaround:**
-
-Our `pipecat_bots/riva_local_tts.py` implementation includes:
-
-1. **Unicode normalization** - Replace curly quotes/dashes that cause `character_mapping` errors:
-   ```python
-   text = text.replace("\u2019", "'")  # Curly apostrophe → straight
-   text = text.replace("\u2014", "-")  # Em dash → hyphen
-   ```
-
-2. **Retry logic** - Detect truncated audio and retry up to 3 times:
-   ```python
-   # If audio is too short for text length, retry
-   if bytes_per_char < 1500:  # ~30ms per character minimum
-       retry...
-   ```
-
-**Status:** This is an NVIDIA server-side bug with no user-configurable workaround. As of NIM version 1.10.0 (December 2025), the issue persists.
-
 ## Model Weights
 
-Both model weight directories are excluded from git due to their size. Download them before running the containers.
+Model weight directories are excluded from git due to their size. Download them before running the containers.
 
 ### ASR Model (Parakeet)
 
@@ -366,19 +506,21 @@ snapshot_download(
 cp vllm/nano_v3_reasoning_parser.py models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/
 ```
 
+### TTS Model (Magpie)
+
+The Magpie TTS model is downloaded automatically from HuggingFace on first run. Set your token:
+
+```bash
+export HUGGINGFACE_ACCESS_TOKEN=hf_your_token_here
+```
+
+The model requires access to:
+- `nvidia/magpie_tts_multilingual_357m` (~1.4GB)
+- `nvidia/nemo-nano-codec-22khz-1.89kbps-21.5fps` (~100MB, downloaded automatically)
+
 ## WebSocket Streaming ASR Server
 
 The server provides real-time streaming speech recognition via WebSocket with progressive interim results.
-
-### Start the Server
-
-```bash
-docker run -d --name nemotron-asr --gpus all --ipc=host \
-  -v $(pwd)/models:/workspace/models:ro \
-  -p 8080:8080 \
-  nemotron-asr:cuda13-full \
-  python -m nemotron_speech.server --port 8080 --right-context 1
-```
 
 ### Latency Options
 
@@ -415,51 +557,12 @@ The `--right-context` parameter controls the accuracy/latency tradeoff:
 
 ### Test the WebSocket Server
 
-**Basic test with test client:**
-
 ```bash
 # Run test (sends audio in 500ms chunks)
 uv run --with websockets tests/test_websocket_client.py tests/fixtures/harvard_16k.wav ws://localhost:8080
-```
 
-**Test with real-time streaming simulation:**
-
-```bash
+# Test with real-time streaming simulation
 uv run --with websockets tests/test_websocket_client.py tests/fixtures/harvard_16k.wav ws://localhost:8080 --chunk 160
-```
-
-**Test multiple chunk sizes:**
-
-```bash
-uv run --with websockets tests/test_websocket_client.py tests/fixtures/harvard_16k.wav ws://localhost:8080 --all
-```
-
-### Example Output
-
-```
-Reading audio file: tests/fixtures/harvard_16k.wav
-  Sample rate: 16000 Hz
-  Duration: 18.36s
-
-Sending audio in 500ms chunks...
-  [interim 1] The
-  [interim 2] The stale
-  [interim 3] The stale smell
-  ...
-  [interim 52] The stale smell of old beer lingers It takes heat to bring o...
-
-FINAL TRANSCRIPT:
-The stale smell of old beer lingers It takes heat to bring out the odor.
-A cold dip restores health and zest. A salt pickle tastes fine with ham.
-Tacos al pastor are my favorite. A zestful food is the hot cross bun.
-
-Statistics:
-  Interim results: 52
-  Real-time factor: 0.14x
-
-Finalization latency:
-  Last audio chunk -> final transcript: 24ms
-  End signal -> final transcript: 24ms
 ```
 
 ## Client Examples
@@ -495,90 +598,6 @@ uv run --with openai examples/llm_client.py --reasoning "What is 15 * 23?"
 uv run --with openai examples/llm_client.py --url http://192.168.1.100:8000/v1 "Hello"
 ```
 
-## Testing Streaming Inference
-
-### Run the Blackwell Streaming Test
-
-This test validates cache-aware streaming ASR on Blackwell GPUs:
-
-```bash
-docker run --rm --gpus all --ipc=host \
-  -v $(pwd)/models:/workspace/models \
-  -v $(pwd)/tests:/workspace/tests \
-  nemotron-asr:cuda13-full \
-  python3 /workspace/tests/test_streaming_blackwell.py
-```
-
-Expected output:
-```
-============================================================
-Cache-Aware Streaming ASR Test on Blackwell GPU
-============================================================
-GPU: NVIDIA GB10
-CUDA: 13.1
-
-Loading model: /workspace/models/Parakeet_Reatime_En_600M.nemo
-...
-Streaming Inference
-  Chunk 1: cache_len=2, pred_shapes=[torch.Size([0])]
-  Chunk 2: cache_len=4, pred_shapes=[torch.Size([0])]
-  ...
-  Chunk 115: cache_len=70, pred_shapes=[torch.Size([85])]
-
-Final transcript (214 chars):
-"The stale smell of old beer lingers It takes heat to bring out the odor..."
-
-SUCCESS - Cache-aware streaming inference completed!
-```
-
-### Run Offline Benchmark
-
-```bash
-docker run --rm --gpus all --ipc=host \
-  -v $(pwd)/models:/workspace/models \
-  -v $(pwd)/tests:/workspace/tests \
-  nemotron-asr:cuda13-full \
-  python3 /workspace/tests/benchmark_inference.py
-```
-
-## Technical Details
-
-### Blackwell (sm_121) Support
-
-The DGX Spark uses the NVIDIA GB10 chip with compute capability 12.1 (sm_121). Standard PyTorch wheels don't include sm_121 kernels, causing CUDA Error 222 during NVRTC compilation.
-
-The `Dockerfile.asr-cuda13-build` solves this by:
-
-1. **CUDA 13.1 Base**: Provides full sm_121 support via NVRTC
-2. **PyTorch from Source**: Built with `TORCH_CUDA_ARCH_LIST="12.1"`
-3. **NCCL Support**: Required by NeMo's distributed training infrastructure
-4. **NeMo NVRTC Patch**: Dynamic GPU architecture detection for runtime compilation
-
-### Key Build Configuration
-
-```dockerfile
-# CUDA architecture for Blackwell
-ENV TORCH_CUDA_ARCH_LIST="12.1"
-
-# Enable distributed (required by NeMo)
-ENV USE_DISTRIBUTED=1
-ENV USE_NCCL=1
-ENV USE_SYSTEM_NCCL=1
-
-# NCCL paths
-ENV NCCL_ROOT=/usr
-ENV NCCL_LIB_DIR=/usr/lib/aarch64-linux-gnu
-ENV NCCL_INCLUDE_DIR=/usr/include
-```
-
-### Streaming Configuration
-
-The model uses cache-aware streaming with:
-- `att_context_size=[70, 1]` - attention context window
-- `chunk_size=[9, 16]` - audio chunk size in frames
-- `shift_size=[9, 16]` - shift between chunks
-- Greedy decoding (CUDA graphs disabled for Blackwell compatibility)
-
 ## Development
 
 ```bash
@@ -596,17 +615,25 @@ uv run python -m nemotron_speech.server --help
 
 ```
 nemotron-speech/
-├── Dockerfile.asr-cuda13-build   # ASR container (CUDA 13.1, Blackwell)
+├── Dockerfile.asr-cuda13-build   # ASR + TTS container (CUDA 13.1, Blackwell)
 ├── Dockerfile.vllm-cuda13-build  # LLM container (vLLM, CUDA 13.1)
 ├── pyproject.toml
 ├── README.md
 ├── .gitignore
+├── scripts/
+│   └── start_asr_tts.sh          # Combined ASR + TTS startup script
 ├── src/
 │   └── nemotron_speech/
 │       ├── __init__.py
 │       ├── server.py             # WebSocket ASR server
+│       ├── tts_server.py         # HTTP TTS server (Magpie)
 │       ├── stt_service.py        # STT service implementation
 │       └── cli.py                # Command-line interface
+├── pipecat_bots/
+│   ├── bot.py                    # Pipecat voice bot
+│   ├── nvidia_stt.py             # Pipecat ASR service (WebSocket client)
+│   ├── magpie_http_tts.py        # Pipecat TTS service (HTTP client)
+│   └── magpie_local_tts.py       # Pipecat TTS service (in-process, for container)
 ├── examples/
 │   ├── asr_client.py             # ASR WebSocket client example
 │   └── llm_client.py             # LLM OpenAI-compatible client example
@@ -615,13 +642,53 @@ nemotron-speech/
 ├── tests/
 │   ├── test_streaming_blackwell.py   # Streaming inference test
 │   ├── test_websocket_client.py      # WebSocket client test
+│   ├── test_magpie_tts.py            # TTS inference test
 │   ├── benchmark_inference.py        # Performance benchmark
 │   └── fixtures/
 │       └── harvard_16k.wav           # Test audio file (16kHz)
-└── models/                           # Model weights (not in git, ~120GB total)
+├── docs/
+│   └── magpie-tts-local-plan.md      # TTS implementation notes
+└── models/                           # Model weights (not in git)
     ├── Parakeet_Reatime_En_600M.nemo     # ASR model (~2.4GB)
     └── NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/  # LLM model (~60GB)
 ```
+
+## Technical Details
+
+### Blackwell (sm_121) Support
+
+The DGX Spark uses the NVIDIA GB10 chip with compute capability 12.1 (sm_121). Standard PyTorch wheels don't include sm_121 kernels, causing CUDA Error 222 during NVRTC compilation.
+
+The `Dockerfile.asr-cuda13-build` solves this by:
+
+1. **CUDA 13.1 Base**: Provides full sm_121 support via NVRTC
+2. **PyTorch from Source**: Built with `TORCH_CUDA_ARCH_LIST="12.1"`
+3. **NeMo Main Branch**: Required for MagpieTTSModel (pinned to specific commit)
+4. **NCCL Support**: Required by NeMo's distributed training infrastructure
+5. **NeMo NVRTC Patch**: Dynamic GPU architecture detection for runtime compilation
+
+### Key Build Configuration
+
+```dockerfile
+# CUDA architecture for Blackwell
+ENV TORCH_CUDA_ARCH_LIST="12.1"
+
+# Enable distributed (required by NeMo)
+ENV USE_DISTRIBUTED=1
+ENV USE_NCCL=1
+ENV USE_SYSTEM_NCCL=1
+
+# NeMo main branch for Magpie TTS support
+ARG NEMO_COMMIT=661af02e105662bd5b61881054608ea44944572c
+```
+
+### Streaming Configuration
+
+The ASR model uses cache-aware streaming with:
+- `att_context_size=[70, 1]` - attention context window
+- `chunk_size=[9, 16]` - audio chunk size in frames
+- `shift_size=[9, 16]` - shift between chunks
+- Greedy decoding (CUDA graphs disabled for Blackwell compatibility)
 
 ## Troubleshooting
 
@@ -665,17 +732,31 @@ NCCL: True
 Gloo: True
 ```
 
+### TTS Model Not Loading
+
+If the TTS server fails to load the model:
+
+1. **Check HuggingFace token**: Ensure `HUGGINGFACE_ACCESS_TOKEN` is set and has access to the model
+2. **Check NeMo version**: The model requires NeMo main branch, not r2.6.0
+
+```bash
+# Verify NeMo has MagpieTTSModel
+docker run --rm nemotron-asr:cuda13-full python3 -c "
+from nemo.collections.tts.models import MagpieTTSModel
+print('MagpieTTSModel available')
+"
+```
+
+### TTS Out of Memory
+
+If TTS fails with OOM when running in a separate container:
+
+- **Solution**: Run TTS in the same container as ASR using `scripts/start_asr_tts.sh`
+- **Cause**: Separate containers create separate CUDA contexts, fragmenting memory
+
 ### vLLM Triton/PTXAS Errors
 
 If you see `PTXASError: ptxas fatal: Value 'sm_121a' is not defined`, the bundled Triton ptxas doesn't support Blackwell. The run command above handles this by symlinking to the system ptxas.
-
-For a permanent fix, rebuild the container with triton configured:
-
-```bash
-# The Dockerfile already includes the fix, but if running manually:
-rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas
-ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas
-```
 
 ### vLLM Out of Memory
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #
-# Pipecat bot using local NVIDIA ASR/LLM with cloud TTS.
+# Pipecat bot using local NVIDIA ASR/LLM/TTS.
 #
 # Based on pipecat/examples/foundational/07-interruptible.py (v0.0.98)
 #
@@ -13,7 +13,8 @@
 #   NVIDIA_ASR_URL - ASR WebSocket URL (default: ws://localhost:8080)
 #   NVIDIA_LLM_URL - LLM API URL (default: http://localhost:8000/v1)
 #   NVIDIA_LLM_MODEL - LLM model name (default: /workspace/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
-#   CARTESIA_API_KEY - Cartesia TTS API key (required)
+#   USE_LOCAL_TTS - Use local Magpie TTS instead of Cartesia (default: true)
+#   CARTESIA_API_KEY - Cartesia TTS API key (required if USE_LOCAL_TTS=false)
 #
 
 import os
@@ -62,7 +63,7 @@ class AudioFrameLogger(FrameProcessor):
 
 # Import our custom local services
 from nvidia_stt import NVidiaWebSocketSTTService
-# from riva_local_tts import RivaLocalTTSService  # Disabled: known truncation bug on DGX Spark
+from magpie_http_tts import MagpieHTTPTTSService  # HTTP client for Magpie TTS server
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
@@ -77,10 +78,11 @@ NVIDIA_LLM_MODEL = os.getenv(
     "NVIDIA_LLM_MODEL",
     "/workspace/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 )
+NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
 
-# Local Magpie TTS (disabled due to truncation bug on DGX Spark)
-# See: https://docs.nvidia.com/nim/riva/tts/latest/release-notes.html
-# NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "localhost:50051")
+# TTS configuration
+# Set USE_LOCAL_TTS=false to use Cartesia cloud TTS instead
+USE_LOCAL_TTS = os.getenv("USE_LOCAL_TTS", "true").lower() in ("true", "1", "yes")
 
 # Transport configurations with VAD and turn analyzer
 transport_params = {
@@ -106,11 +108,12 @@ transport_params = {
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-    logger.info("Starting bot (local ASR/LLM, cloud TTS)")
+    tts_type = f"Magpie ({NVIDIA_TTS_URL})" if USE_LOCAL_TTS else "Cartesia (cloud)"
+    logger.info(f"Starting bot (local ASR/LLM, {tts_type} TTS)")
     logger.info(f"  ASR URL: {NVIDIA_ASR_URL}")
     logger.info(f"  LLM URL: {NVIDIA_LLM_URL}")
     logger.info(f"  LLM Model: {NVIDIA_LLM_MODEL}")
-    logger.info(f"  TTS: Cartesia (cloud)")
+    logger.info(f"  TTS URL: {NVIDIA_TTS_URL if USE_LOCAL_TTS else 'Cartesia cloud'}")
     logger.info(f"  Transport type: {type(transport).__name__}")
 
     # NVIDIA Parakeet ASR via WebSocket
@@ -119,18 +122,20 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         sample_rate=16000,
     )
 
-    # Cartesia TTS (cloud) - using this because Magpie TTS has truncation bugs on DGX Spark
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22",  # British Lady
-    )
-
-    # Local NVIDIA Riva/Magpie TTS (disabled due to truncation bug on DGX Spark)
-    # See README.md "Known Issue: Incomplete Audio on DGX Spark" for details
-    # tts = RivaLocalTTSService(
-    #     server=NVIDIA_TTS_URL,
-    #     voice_id="Magpie-Multilingual.EN-US.Aria",
-    # )
+    # TTS service selection
+    if USE_LOCAL_TTS:
+        # Magpie TTS via HTTP server (runs in container, client runs on host)
+        tts = MagpieHTTPTTSService(
+            server_url=NVIDIA_TTS_URL,
+            voice="aria",
+            language="en",
+        )
+    else:
+        # Cartesia TTS (cloud) - fallback option
+        tts = CartesiaTTSService(
+            api_key=os.getenv("CARTESIA_API_KEY"),
+            voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22",  # British Lady
+        )
 
     # NVIDIA Nemotron-3-Nano LLM via vLLM (OpenAI-compatible API)
     llm = OpenAILLMService(
