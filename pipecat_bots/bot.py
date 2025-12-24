@@ -13,7 +13,11 @@
 #   NVIDIA_ASR_URL - ASR WebSocket URL (default: ws://localhost:8080)
 #   NVIDIA_LLM_URL - LLM API URL (default: http://localhost:8000/v1)
 #   NVIDIA_LLM_MODEL - LLM model name (default: /workspace/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
+#   NVIDIA_TTS_URL - Magpie TTS server URL (default: http://localhost:8001)
 #   USE_LOCAL_TTS - Use local Magpie TTS instead of Cartesia (default: true)
+#   USE_STREAMING_TTS - Use streaming TTS for lower TTFB ~150ms vs ~550ms (default: true)
+#   USE_ADAPTIVE_TTS - Use adaptive streaming TTS for best quality with fast TTFB (default: false)
+#   USE_WEBSOCKET_TTS - Use WebSocket adaptive TTS (solves HTTP blocking issues) (default: false)
 #   CARTESIA_API_KEY - Cartesia TTS API key (required if USE_LOCAL_TTS=false)
 #
 
@@ -63,7 +67,10 @@ class AudioFrameLogger(FrameProcessor):
 
 # Import our custom local services
 from nvidia_stt import NVidiaWebSocketSTTService
-from magpie_http_tts import MagpieHTTPTTSService  # HTTP client for Magpie TTS server
+from magpie_http_tts import MagpieHTTPTTSService  # HTTP client for Magpie TTS server (batch)
+from magpie_streaming_tts import MagpieStreamingTTSService  # HTTP client for streaming TTS
+from magpie_adaptive_tts import MagpieAdaptiveTTSService  # Adaptive streaming TTS (HTTP)
+from magpie_websocket_tts import MagpieWebSocketTTSService  # WebSocket adaptive TTS
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
@@ -83,6 +90,12 @@ NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
 # TTS configuration
 # Set USE_LOCAL_TTS=false to use Cartesia cloud TTS instead
 USE_LOCAL_TTS = os.getenv("USE_LOCAL_TTS", "true").lower() in ("true", "1", "yes")
+# Set USE_STREAMING_TTS=true for lower TTFB (~150ms vs ~550ms batch)
+USE_STREAMING_TTS = os.getenv("USE_STREAMING_TTS", "true").lower() in ("true", "1", "yes")
+# Set USE_ADAPTIVE_TTS=true for adaptive streaming (streaming for TTFB, batch for quality)
+USE_ADAPTIVE_TTS = os.getenv("USE_ADAPTIVE_TTS", "false").lower() in ("true", "1", "yes")
+# Set USE_WEBSOCKET_TTS=true for WebSocket-based adaptive streaming (solves HTTP blocking)
+USE_WEBSOCKET_TTS = os.getenv("USE_WEBSOCKET_TTS", "false").lower() in ("true", "1", "yes")
 
 # Transport configurations with VAD and turn analyzer
 transport_params = {
@@ -108,13 +121,25 @@ transport_params = {
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-    tts_type = f"Magpie ({NVIDIA_TTS_URL})" if USE_LOCAL_TTS else "Cartesia (cloud)"
+    if USE_LOCAL_TTS:
+        if USE_WEBSOCKET_TTS:
+            tts_mode = "websocket"
+        elif USE_ADAPTIVE_TTS:
+            tts_mode = "adaptive-http"
+        elif USE_STREAMING_TTS:
+            tts_mode = "streaming"
+        else:
+            tts_mode = "batch"
+        tts_type = f"Magpie {tts_mode} ({NVIDIA_TTS_URL})"
+    else:
+        tts_mode = "cloud"
+        tts_type = "Cartesia (cloud)"
     logger.info(f"Starting bot (local ASR/LLM, {tts_type} TTS)")
     logger.info(f"  ASR URL: {NVIDIA_ASR_URL}")
     logger.info(f"  LLM URL: {NVIDIA_LLM_URL}")
     logger.info(f"  LLM Model: {NVIDIA_LLM_MODEL}")
-    logger.info(f"  TTS URL: {NVIDIA_TTS_URL if USE_LOCAL_TTS else 'Cartesia cloud'}")
-    logger.info(f"  Transport type: {type(transport).__name__}")
+    logger.info(f"  TTS: {tts_type}")
+    logger.info(f"  Transport: {type(transport).__name__}")
 
     # NVIDIA Parakeet ASR via WebSocket
     stt = NVidiaWebSocketSTTService(
@@ -124,12 +149,38 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     # TTS service selection
     if USE_LOCAL_TTS:
-        # Magpie TTS via HTTP server (runs in container, client runs on host)
-        tts = MagpieHTTPTTSService(
-            server_url=NVIDIA_TTS_URL,
-            voice="aria",
-            language="en",
-        )
+        if USE_WEBSOCKET_TTS:
+            # WebSocket Magpie TTS - full-duplex, solves HTTP blocking issues
+            tts = MagpieWebSocketTTSService(
+                server_url=NVIDIA_TTS_URL,
+                voice="aria",
+                language="en",
+            )
+            logger.info("Using WebSocket Magpie TTS (full-duplex adaptive)")
+        elif USE_ADAPTIVE_TTS:
+            # HTTP Adaptive Magpie TTS - streaming TTFB, batch quality when buffer healthy
+            tts = MagpieAdaptiveTTSService(
+                server_url=NVIDIA_TTS_URL,
+                voice="aria",
+                language="en",
+            )
+            logger.info("Using HTTP adaptive Magpie TTS (streaming TTFB, batch quality)")
+        elif USE_STREAMING_TTS:
+            # Streaming Magpie TTS - lower TTFB (~150ms vs ~550ms)
+            tts = MagpieStreamingTTSService(
+                server_url=NVIDIA_TTS_URL,
+                voice="aria",
+                language="en",
+            )
+            logger.info("Using streaming Magpie TTS (low TTFB)")
+        else:
+            # Batch Magpie TTS via HTTP server
+            tts = MagpieHTTPTTSService(
+                server_url=NVIDIA_TTS_URL,
+                voice="aria",
+                language="en",
+            )
+            logger.info("Using batch Magpie TTS")
     else:
         # Cartesia TTS (cloud) - fallback option
         tts = CartesiaTTSService(
@@ -158,9 +209,16 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             "role": "system",
             "content": (
                 "You are a helpful AI assistant running on an NVIDIA DGX Spark. "
+                "You are built with Nemotron 3 Nano, a large language model developed by NVIDIA. "
                 "Your goal is to have a natural conversation with the user. "
                 "Keep your responses concise and conversational since they will be spoken aloud. "
-                "Avoid special characters that can't easily be spoken, such as emojis or bullet points."
+                "Avoid special characters. Use only simple, plain text sentences."
+            ),
+        },
+                {
+            "role": "user",
+            "content": (
+                "Introduce yourself. Tell the user that you are an assistant and what platform and model you are running on."
             ),
         },
     ]

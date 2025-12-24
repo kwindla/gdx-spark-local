@@ -1,0 +1,61 @@
+# Combined vLLM + llama.cpp container for DGX Spark (Blackwell GB10)
+#
+# This extends the vLLM CUDA 13 container to add llama.cpp support,
+# enabling both BF16 inference (vLLM) and quantized GGUF inference (llama.cpp).
+#
+# Usage:
+#   # Build
+#   docker build -f Dockerfile.vllm-llamacpp -t vllm-llamacpp:cuda13 .
+#
+#   # Run vLLM mode (BF16)
+#   docker run --gpus all -p 8000:8000 -v $(pwd)/models:/models vllm-llamacpp:cuda13 \
+#       python -m vllm.entrypoints.openai.api_server --model /models/BF16-model ...
+#
+#   # Run llama.cpp mode (GGUF)
+#   docker run --gpus all -p 8000:8000 -v $(pwd)/models:/models vllm-llamacpp:cuda13 \
+#       llama-server -m /models/model.gguf --host 0.0.0.0 --port 8000
+
+FROM vllm:cuda13-full
+
+LABEL maintainer="nemotron-speech"
+LABEL description="Combined vLLM + llama.cpp for NVIDIA DGX Spark (Blackwell GB10, sm_121a)"
+
+# Install build dependencies (most should already be present)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake \
+    git \
+    libcurl4-openssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone and build llama.cpp with CUDA support for Blackwell (sm_121a)
+# Note: sm_121a (with 'a' suffix) enables architecture-accelerated features
+# including block scale MMA required for MXFP4 support. Requires CUDA 13.1+.
+ARG LLAMA_CPP_VERSION=master
+RUN git clone --depth 1 --branch ${LLAMA_CPP_VERSION} \
+        https://github.com/ggerganov/llama.cpp.git /opt/llama.cpp && \
+    cd /opt/llama.cpp && \
+    cmake -B build \
+        -DGGML_CUDA=ON \
+        -DGGML_CUDA_F16=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="121a" \
+        -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build --config Release -j$(nproc) && \
+    # Install binaries and shared libraries to /usr/local
+    cp build/bin/llama-server /usr/local/bin/ && \
+    cp build/bin/llama-cli /usr/local/bin/ && \
+    cp build/bin/llama-quantize /usr/local/bin/ && \
+    cp build/bin/llama-bench /usr/local/bin/ && \
+    cp build/bin/*.so* /usr/local/lib/ 2>/dev/null || true && \
+    ldconfig && \
+    # Clean up build artifacts to save space
+    rm -rf /opt/llama.cpp/build && \
+    rm -rf /opt/llama.cpp/.git
+
+# Verify installations
+RUN llama-server --version || echo "llama-server installed" && \
+    python -c "import vllm; print(f'vLLM version: {vllm.__version__}')"
+
+WORKDIR /workspace
+
+# Default to bash - user specifies vllm or llama-server command
+CMD ["bash"]
