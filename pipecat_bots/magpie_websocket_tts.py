@@ -15,8 +15,11 @@ Usage:
     # In pipeline: ... -> llm -> tts -> transport.output() -> ...
 """
 
+import asyncio
 import json
+import re
 import time
+from collections import deque
 from typing import AsyncGenerator, Optional
 
 from loguru import logger
@@ -37,6 +40,9 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.tts_service import WebsocketTTSService
 
+# Import the continue frame for LLM/TTS synchronization
+from llama_cpp_chunked_llm import ChunkedLLMContinueGenerationFrame
+
 try:
     from websockets.asyncio.client import connect as websocket_connect
     from websockets.protocol import State
@@ -47,6 +53,46 @@ except ModuleNotFoundError as e:
 
 # Magpie outputs at 22kHz
 MAGPIE_SAMPLE_RATE = 22000
+
+# Regex pattern for emoji and other non-speakable characters
+# Covers most emoji ranges including emoticons, symbols, and pictographs
+EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"  # Emoticons
+    "\U0001F300-\U0001F5FF"  # Misc Symbols and Pictographs
+    "\U0001F680-\U0001F6FF"  # Transport and Map
+    "\U0001F700-\U0001F77F"  # Alchemical Symbols
+    "\U0001F780-\U0001F7FF"  # Geometric Shapes Extended
+    "\U0001F800-\U0001F8FF"  # Supplemental Arrows-C
+    "\U0001F900-\U0001F9FF"  # Supplemental Symbols and Pictographs
+    "\U0001FA00-\U0001FA6F"  # Chess Symbols
+    "\U0001FA70-\U0001FAFF"  # Symbols and Pictographs Extended-A
+    "\U00002702-\U000027B0"  # Dingbats
+    "\U0001F1E0-\U0001F1FF"  # Flags (iOS)
+    "]+",
+    flags=re.UNICODE
+)
+
+
+def sanitize_text_for_tts(text: str) -> str:
+    """Remove emojis and normalize special characters for TTS.
+
+    Args:
+        text: Raw text from LLM
+
+    Returns:
+        Sanitized text safe for TTS synthesis
+    """
+    # Remove emojis
+    text = EMOJI_PATTERN.sub("", text)
+    # Normalize curly quotes and dashes
+    text = text.replace("\u2018", "'")  # LEFT SINGLE QUOTATION MARK
+    text = text.replace("\u2019", "'")  # RIGHT SINGLE QUOTATION MARK
+    text = text.replace("\u201C", '"')  # LEFT DOUBLE QUOTATION MARK
+    text = text.replace("\u201D", '"')  # RIGHT DOUBLE QUOTATION MARK
+    text = text.replace("\u2014", "-")  # EM DASH
+    text = text.replace("\u2013", "-")  # EN DASH
+    return text
 
 
 class MagpieWebSocketTTSService(WebsocketTTSService):
@@ -59,17 +105,28 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
     - On LLMFullResponseEndFrame: send close message to trigger final flush
     - On interruption: disconnect and reconnect
 
+    Adaptive mode switching:
+    - First segment of each response uses streaming mode for fast TTFB (~370ms)
+    - Subsequent segments use batch mode for higher quality
+
     Message protocol:
-    - Send: {"type": "init", "voice": "...", "language": "..."}
-    - Send: {"type": "text", "text": "..."}
+    - Send: {"type": "init", "voice": "...", "language": "...", "default_mode": "batch"}
+    - Send: {"type": "text", "text": "...", "mode": "stream|batch", "preset": "..."}
     - Send: {"type": "close"} - triggers server to flush remaining text
     - Receive: binary audio data
+    - Receive: {"type": "segment_complete", ...} - segment done, more may come
     - Receive: {"type": "done", ...} - stream complete
     """
 
     class InputParams(BaseModel):
         """Input parameters for Magpie WebSocket TTS."""
         language: str = "en"
+        # Streaming preset for first segment: aggressive (~185ms), balanced (~280ms), conservative (~370ms)
+        streaming_preset: str = "conservative"
+        # Whether to use streaming mode for first segment (vs batch for all)
+        use_adaptive_mode: bool = True
+        # Pause duration (ms) between sentences for natural speech rhythm
+        sentence_pause_ms: int = 250
 
     def __init__(
         self,
@@ -112,6 +169,17 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
         self._stream_active = False
         self._stream_start_time: Optional[float] = None
         self._first_audio_received = False
+        self._is_first_segment = True  # Track if this is first segment of response
+        # Queue tracking which segments need silence pause after them
+        # Populated in run_tts(), consumed in _receive_messages() on segment_complete
+        self._segment_sentence_boundary_queue: deque[bool] = deque()
+
+        # Generation tracking for interruption handling
+        # _gen is incremented on interruption to invalidate old audio
+        # _confirmed_gen is set to _gen when stream_created is received
+        # Audio is only accepted when _confirmed_gen == _gen
+        self._gen = 0
+        self._confirmed_gen = 0
 
         # Receive task
         self._receive_task = None
@@ -121,11 +189,31 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
 
         logger.info(
             f"MagpieWebSocketTTS initialized: server={self._server_url}, "
-            f"voice={voice}, language={language}"
+            f"voice={voice}, language={language}, "
+            f"adaptive_mode={self._params.use_adaptive_mode}, "
+            f"streaming_preset={self._params.streaming_preset}"
         )
 
     def can_generate_metrics(self) -> bool:
         return True
+
+    def _ends_at_sentence_boundary(self, text: str) -> bool:
+        """Check if text ends at a sentence boundary (for inter-sentence pauses)."""
+        text = text.strip()
+        return bool(text) and text[-1] in '.!?'
+
+    def _generate_silence_frames(self, duration_ms: int) -> bytes:
+        """Generate silence audio (zeros) for the given duration.
+
+        Args:
+            duration_ms: Duration of silence in milliseconds
+
+        Returns:
+            Bytes of silent audio (16-bit PCM, mono, at sample_rate)
+        """
+        # 16-bit PCM = 2 bytes per sample
+        num_samples = int(self.sample_rate * duration_ms / 1000)
+        return bytes(num_samples * 2)  # zeros
 
     async def start(self, frame: StartFrame):
         """Handle StartFrame - connect WebSocket."""
@@ -151,11 +239,39 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
             await self.flush_audio()
 
     async def _handle_interruption(self, frame: InterruptionFrame, direction: FrameDirection):
-        """Handle interruption by disconnecting and reconnecting."""
-        await super()._handle_interruption(frame, direction)
-        # Disconnect and reconnect to clear server state
-        await self._disconnect()
-        await self._connect()
+        """Handle interruption by resetting state and cancelling server generation.
+
+        Per design spec, WebSocket connections persist for the pipeline lifetime.
+        We reset server state via the cancel message, which immediately stops
+        generation (unlike close which lets pending audio finish).
+
+        NOTE: We intentionally do NOT call super()._handle_interruption() because
+        the base WebsocketTTSService disconnects/reconnects, which violates our
+        design spec. We handle all interruption logic here.
+        """
+        # Stop any metrics (what base class would do)
+        await self.stop_all_metrics()
+
+        # Increment generation to invalidate any in-flight audio
+        # Audio will be discarded until we receive stream_created for the new gen
+        self._gen += 1
+
+        # Send cancel message to immediately stop server generation
+        # Unlike flush_audio() which sends "close" and lets audio finish,
+        # "cancel" tells server to stop immediately
+        if self._websocket:
+            try:
+                await self._websocket.send(json.dumps({"type": "cancel"}))
+                logger.debug(f"WS cancel sent (interruption, gen={self._gen})")
+            except Exception as e:
+                logger.debug(f"Failed to send cancel: {e}")
+
+        # Reset local state for next response
+        self._stream_active = False
+        self._stream_start_time = None
+        self._first_audio_received = False
+        self._is_first_segment = True
+        self._segment_sentence_boundary_queue.clear()
 
     async def _connect(self):
         """Connect to WebSocket and start receive task."""
@@ -173,7 +289,13 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
             self._receive_task = None
 
         await self._disconnect_websocket()
+
+        # Reset all stream state for clean slate
         self._stream_active = False
+        self._stream_start_time = None
+        self._first_audio_received = False
+        self._is_first_segment = True
+        self._segment_sentence_boundary_queue.clear()
 
     async def _connect_websocket(self):
         """Establish WebSocket connection and send init message."""
@@ -229,11 +351,22 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
         async for message in self._get_websocket():
             if isinstance(message, bytes):
                 # Binary message = audio data
+
+                # Discard stale audio from previous generation (after interruption)
+                # Audio is only valid after we receive stream_created for current gen
+                if self._confirmed_gen != self._gen:
+                    logger.debug(
+                        f"Discarding stale audio (confirmed={self._confirmed_gen}, "
+                        f"current={self._gen})"
+                    )
+                    continue
+
                 if not self._first_audio_received:
                     await self.stop_ttfb_metrics()
                     if self._stream_start_time:
                         ttfb_ms = (time.time() - self._stream_start_time) * 1000
-                        logger.info(f"MagpieWebSocketTTS TTFB: {ttfb_ms:.0f}ms")
+                        mode = "stream" if self._is_first_segment else "batch"
+                        logger.info(f"MagpieWebSocketTTS TTFB: {ttfb_ms:.0f}ms (mode={mode})")
                     self._first_audio_received = True
 
                 await self.push_frame(
@@ -248,7 +381,41 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
 
                     if msg_type == "stream_created":
                         stream_id = msg.get("stream_id", "")[:8]
-                        logger.debug(f"WS stream created: {stream_id}")
+                        # Confirm this generation - audio after this point is valid
+                        self._confirmed_gen = self._gen
+                        logger.debug(f"WS stream created: {stream_id} (gen={self._gen})")
+
+                    elif msg_type == "segment_complete":
+                        # Segment done, switch to batch mode for subsequent segments
+                        segment = msg.get("segment", 0)
+                        audio_ms = msg.get("audio_ms", 0)
+                        logger.debug(f"WS segment {segment} complete: {audio_ms:.0f}ms audio")
+                        # After first segment completes, subsequent segments use batch mode
+                        self._is_first_segment = False
+                        self._first_audio_received = False  # Reset for next segment TTFB
+
+                        # Inject silence pause if this segment ended at sentence boundary
+                        if self._segment_sentence_boundary_queue:
+                            ended_with_sentence = self._segment_sentence_boundary_queue.popleft()
+                            if ended_with_sentence and self._params.sentence_pause_ms > 0:
+                                silence = self._generate_silence_frames(
+                                    self._params.sentence_pause_ms
+                                )
+                                logger.info(
+                                    f"Injecting {self._params.sentence_pause_ms}ms silence "
+                                    f"after segment {segment}"
+                                )
+                                await self.push_frame(
+                                    TTSAudioRawFrame(silence, self.sample_rate, 1)
+                                )
+
+                        # Signal ChunkedLLMService that this segment is complete
+                        # so it can continue generating the next chunk
+                        logger.debug(f"Signaling LLM to continue after segment {segment}")
+                        await self.push_frame(
+                            ChunkedLLMContinueGenerationFrame(),
+                            FrameDirection.UPSTREAM
+                        )
 
                     elif msg_type == "done":
                         total_ms = msg.get("total_audio_ms", 0)
@@ -258,6 +425,8 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
                             f"{segments} segments"
                         )
                         self._stream_active = False
+                        self._is_first_segment = True  # Reset for next response
+                        self._segment_sentence_boundary_queue.clear()
                         await self.push_frame(TTSStoppedFrame())
 
                     elif msg_type == "error":
@@ -275,11 +444,14 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
         """Send close message to trigger server to flush remaining text.
 
         Called when LLM finishes a complete response.
+        Resets first_segment flag so next response starts with streaming mode.
         """
         if self._websocket and self._stream_active:
             try:
                 await self._websocket.send(json.dumps({"type": "close"}))
-                logger.debug("WS close sent (flush)")
+                logger.debug("WS chunk stream close sent (flush)")
+                # Reset for next response - done message handler also resets this
+                # but we set it here too in case done message is delayed
             except Exception as e:
                 logger.debug(f"Failed to send close: {e}")
 
@@ -289,15 +461,27 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
         Called for each token from LLM (aggregate_sentences=False).
         Audio arrives asynchronously via _receive_messages.
 
+        In adaptive mode:
+        - First segment uses streaming mode for fast TTFB
+        - Subsequent segments use batch mode for higher quality
+
+        Inter-sentence pauses:
+        - Silence is injected AFTER segment_complete in _receive_messages
+        - This ensures the pause occurs after the audio is played, not before
+
         Args:
             text: Text token to synthesize.
 
         Yields:
             TTSStartedFrame on first token, then None.
         """
+        # Sanitize text (remove emojis, normalize quotes/dashes)
+        text = sanitize_text_for_tts(text)
+
         logger.debug(f"MagpieWebSocketTTS: run_tts [{text}]")
 
-        if not text:
+        # Skip empty or whitespace-only text (e.g., after emoji removal)
+        if not text or not text.strip():
             yield None
             return
 
@@ -311,14 +495,30 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
                 self._stream_active = True
                 self._stream_start_time = time.time()
                 self._first_audio_received = False
+                self._is_first_segment = True  # First segment of new response
                 await self.start_ttfb_metrics()
                 yield TTSStartedFrame()
 
             await self.start_tts_usage_metrics(text)
 
-            # Send text message
-            await self._get_websocket().send(
-                json.dumps({"type": "text", "text": text})
+            # Build text message with mode selection
+            msg = {"type": "text", "text": text}
+
+            if self._params.use_adaptive_mode:
+                # First segment: streaming for fast TTFB
+                # Subsequent segments: batch for quality
+                if self._is_first_segment:
+                    msg["mode"] = "stream"
+                    msg["preset"] = self._params.streaming_preset
+                else:
+                    msg["mode"] = "batch"
+
+            await self._get_websocket().send(json.dumps(msg))
+
+            # Track whether this segment ends at sentence boundary
+            # Consumed by _receive_messages on segment_complete to inject silence
+            self._segment_sentence_boundary_queue.append(
+                self._ends_at_sentence_boundary(text)
             )
 
             yield None

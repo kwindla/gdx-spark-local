@@ -22,7 +22,7 @@ from pipecat.frames.frames import (
     InterimTranscriptionFrame,
     StartFrame,
     TranscriptionFrame,
-    UserStoppedSpeakingFrame,
+    VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.stt_service import WebsocketSTTService
@@ -37,7 +37,7 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
 
     The server expects:
     - Audio: 16-bit PCM, 16kHz, mono
-    - End signal: {"type": "end"} or {"type": "reset"}
+    - Reset signal: {"type": "reset"} to finalize current utterance
 
     The server sends:
     - Ready: {"type": "ready"}
@@ -121,8 +121,9 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         """
         await super().process_frame(frame, direction)
 
-        # When user stops speaking, send reset signal to get final transcription
-        if isinstance(frame, UserStoppedSpeakingFrame):
+        # Trigger transcript finalization on VAD silence detection (200ms)
+        # This fires BEFORE Smart Turn analysis, giving us earlier final transcripts
+        if isinstance(frame, VADUserStoppedSpeakingFrame):
             await self._send_reset()
 
     async def _send_reset(self):

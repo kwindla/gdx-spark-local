@@ -13,6 +13,8 @@ Environment variables:
 import argparse
 import asyncio
 import os
+import re
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -207,7 +209,7 @@ class StreamStatusResponse(BaseModel):
     state: str
     segments_generated: int
     audio_ms: float
-    buffer_ms: float
+    pending_segments: int
 
 
 @app.get("/health")
@@ -492,14 +494,42 @@ async def synthesize_speech_stream(request: StreamingSpeechRequest):
 # =============================================================================
 
 
+# Regex pattern to match emoji characters
+# Covers: emoticons, dingbats, symbols, flags, skin tones, etc.
+_EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F600-\U0001F64F"  # Emoticons
+    "\U0001F300-\U0001F5FF"  # Misc symbols and pictographs
+    "\U0001F680-\U0001F6FF"  # Transport and map symbols
+    "\U0001F700-\U0001F77F"  # Alchemical symbols
+    "\U0001F780-\U0001F7FF"  # Geometric shapes extended
+    "\U0001F800-\U0001F8FF"  # Supplemental arrows-C
+    "\U0001F900-\U0001F9FF"  # Supplemental symbols and pictographs
+    "\U0001FA00-\U0001FA6F"  # Chess symbols
+    "\U0001FA70-\U0001FAFF"  # Symbols and pictographs extended-A
+    "\U00002702-\U000027B0"  # Dingbats
+    "\U000024C2-\U0001F251"  # Enclosed characters
+    "]+",
+    flags=re.UNICODE
+)
+
+
 def normalize_text(text: str) -> str:
-    """Normalize unicode characters in text."""
+    """Normalize unicode characters in text.
+
+    Handles:
+    - Smart quotes -> ASCII quotes
+    - Em/en dashes -> hyphens
+    - Emoji characters -> removed (causes tokenizer crash)
+    """
     text = text.replace("\u2018", "'")  # LEFT SINGLE QUOTATION MARK
     text = text.replace("\u2019", "'")  # RIGHT SINGLE QUOTATION MARK
     text = text.replace("\u201C", '"')  # LEFT DOUBLE QUOTATION MARK
     text = text.replace("\u201D", '"')  # RIGHT DOUBLE QUOTATION MARK
     text = text.replace("\u2014", "-")  # EM DASH
     text = text.replace("\u2013", "-")  # EN DASH
+    # Remove emoji characters that crash the tokenizer
+    text = _EMOJI_PATTERN.sub("", text)
     return text
 
 
@@ -640,9 +670,7 @@ async def receive_tts_audio(stream_id: str):
     speaker_idx = SPEAKERS[stream.voice]
 
     async def audio_generator() -> AsyncGenerator[bytes, None]:
-        """Generate audio adaptively based on buffer status."""
-        from nemotron_speech.streaming_tts import StreamingMagpieTTS, StreamingConfig
-
+        """Generate audio for pending segments using batch mode."""
         boundary_handler = AudioBoundaryHandler(MAGPIE_SAMPLE_RATE)
         chunk_buffer = ChunkedAudioBuffer(chunk_size_bytes=4096)
 
@@ -654,57 +682,33 @@ async def receive_tts_audio(stream_id: str):
                 if not stream.has_pending_text():
                     if stream.state == StreamState.CLOSED:
                         break  # No more text coming
-
-                    # Wait for text with timeout
-                    stream.text_available.clear()
-                    try:
-                        await asyncio.wait_for(
-                            stream.text_available.wait(),
-                            timeout=0.1,
-                        )
-                    except asyncio.TimeoutError:
-                        # Flush text buffer on timeout
-                        stream.flush_text_buffer()
-                        continue
+                    # Poll for new text
+                    await asyncio.sleep(0.01)
+                    continue
 
                 # Get next segment
                 text = stream.get_next_segment()
                 if text is None:
                     continue
 
-                logger.info(
-                    f"[{stream.stream_id[:8]}] Generating: '{text[:50]}...' "
-                    f"mode={stream.generation_mode.value} buffer={stream.buffer_ms:.0f}ms"
+                logger.info(f"[{stream.stream_id[:8]}] Generating: '{text[:50]}...'")
+
+                # Generate audio using batch mode
+                audio_bytes = await _generate_batch(
+                    model, text, stream.language, speaker_idx
                 )
 
-                # Generate audio based on mode
-                if stream.should_use_batch:
-                    # Batch mode: higher quality, full generation
-                    audio_bytes = await _generate_batch(
-                        model, text, stream.language, speaker_idx
-                    )
+                # Process through boundary handler
+                is_final = (
+                    stream.state == StreamState.CLOSED
+                    and not stream.has_pending_text()
+                )
+                processed = boundary_handler.process_segment(audio_bytes, is_final)
+                stream.record_audio_generated(len(processed))
 
-                    # Process through boundary handler
-                    is_final = (
-                        stream.state == StreamState.CLOSED
-                        and not stream.has_pending_text()
-                    )
-                    processed = boundary_handler.process_segment(audio_bytes, is_final)
-                    stream.record_audio_generated(len(processed))
-
-                    # Yield in chunks
-                    for chunk in chunk_buffer.add(processed):
-                        yield chunk
-
-                else:
-                    # Streaming mode: fast TTFB, frame-by-frame
-                    async for audio_chunk in _generate_streaming(
-                        model, text, stream.language, speaker_idx
-                    ):
-                        # For streaming, we yield immediately for low latency
-                        # Boundary handling is simpler - just record the audio
-                        stream.record_audio_generated(len(audio_chunk))
-                        yield audio_chunk
+                # Yield in chunks
+                for chunk in chunk_buffer.add(processed):
+                    yield chunk
 
                 stream.mark_segment_complete()
 
@@ -757,15 +761,27 @@ async def websocket_tts_stream(websocket: WebSocket):
     - Single connection handles both directions simultaneously
 
     Client -> Server messages (JSON):
-        {"type": "init", "voice": "aria", "language": "en"} - Initialize stream
-        {"type": "text", "text": "Hello world"} - Append text
+        {"type": "init", "voice": "aria", "language": "en", "default_mode": "batch"}
+            - Initialize stream
+            - default_mode: "batch" (default) or "stream"
+
+        {"type": "text", "text": "Hello world", "mode": "stream", "preset": "conservative"}
+            - Append text segment for synthesis
+            - mode: "batch" (default) or "stream"
+              - "batch": Full generation, higher quality
+              - "stream": Frame-by-frame, faster TTFB
+            - preset: Only for stream mode - "aggressive", "balanced", "conservative" (default)
+              - aggressive: ~185ms TTFB
+              - balanced: ~280ms TTFB
+              - conservative: ~370ms TTFB
+
         {"type": "close"} - Signal end of text input
         {"type": "cancel"} - Abort immediately
         {"type": "ping"} - Keepalive
 
     Server -> Client messages:
         {"type": "stream_created", "stream_id": "..."} - Stream ready
-        {"type": "metadata", "buffer_ms": 1250, "mode": "batch"} - Status update
+        {"type": "segment_complete", "segment": 1, "audio_ms": 1234} - Segment audio sent
         {"type": "done", "total_audio_ms": 5432} - Stream complete
         {"type": "error", "message": "...", "fatal": false} - Error
         {"type": "pong"} - Keepalive response
@@ -780,15 +796,17 @@ async def websocket_tts_stream(websocket: WebSocket):
     # Default configuration
     voice = "aria"
     language = "en"
+    default_mode = "batch"
+
+    # Segment queue: list of (text, mode, preset) tuples
+    segment_queue: list[tuple[str, str, Optional[str]]] = []
+    queue_lock = asyncio.Lock()
+    queue_event = asyncio.Event()  # Signal when new segments added
 
     async def send_audio():
         """Background task to generate and send audio via WebSocket.
 
-        Simple loop:
-        1. Try to flush buffer if enough audio accumulated
-        2. Generate audio for pending segments (batch mode)
-        3. Exit when closed and nothing left
-        4. Sleep briefly to yield to receive loop
+        Processes segments from queue, using streaming or batch mode as specified.
         """
         nonlocal stream
         if stream is None:
@@ -809,47 +827,99 @@ async def websocket_tts_stream(websocket: WebSocket):
 
         try:
             while True:
-                # Try to flush buffer → pending queue
-                flushed = stream.flush_text_buffer()
-                if flushed:
-                    words = len(flushed.split())
-                    logger.info(f"[{stream.stream_id[:8]}] Flushed {words} words: '{flushed[:40]}...'")
+                # Get next segment from queue
+                segment = None
+                async with queue_lock:
+                    if segment_queue:
+                        segment = segment_queue.pop(0)
 
-                # Generate audio for pending segments
-                if stream.pending_text:
-                    text = stream.pending_text.pop(0)
-                    logger.info(f"[{stream.stream_id[:8]}] Generating: '{text[:50]}...'")
+                if segment:
+                    text, mode, preset = segment
+                    logger.info(f"[{stream.stream_id[:8]}] Generating: '{text[:50]}...' mode={mode}")
+                    segment_bytes = 0
 
-                    # Generate audio (batch mode)
-                    audio_bytes = await _generate_batch(
-                        model, text, stream.language, speaker_idx
-                    )
+                    if mode == "stream":
+                        # Streaming mode: frame-by-frame for fast TTFB
+                        chunk_count = 0
+                        # Cancel event for early termination on interruption
+                        segment_cancel = threading.Event()
+                        async for audio_chunk in _generate_streaming_with_preset(
+                            model, text, stream.language, speaker_idx, preset or "conservative",
+                            cancel_event=segment_cancel
+                        ):
+                            # Check if stream was cancelled (interruption)
+                            if stream.state == StreamState.CANCELLED:
+                                segment_cancel.set()  # Signal thread to stop
+                                logger.debug(f"[{stream.stream_id[:8]}] Streaming cancelled mid-generation")
+                                break
 
-                    # Track first audio TTFB
-                    if first_audio_time is None:
-                        first_audio_time = time.time()
-                        ttfb = (first_audio_time - stream.created_at) * 1000
-                        logger.info(f"[{stream.stream_id[:8]}] First audio, TTFB: {ttfb:.0f}ms")
+                            # Track first audio TTFB
+                            if first_audio_time is None:
+                                first_audio_time = time.time()
+                                ttfb = (first_audio_time - stream.created_at) * 1000
+                                logger.info(f"[{stream.stream_id[:8]}] First audio (streaming), TTFB: {ttfb:.0f}ms")
 
-                    stream.record_audio_generated(len(audio_bytes))
+                            stream.record_audio_generated(len(audio_chunk))
+                            segment_bytes += len(audio_chunk)
+                            chunk_count += 1
+
+                            # Send immediately for lowest latency
+                            try:
+                                await websocket.send_bytes(audio_chunk)
+                            except Exception:
+                                return  # WebSocket closed
+
+                        logger.debug(f"[{stream.stream_id[:8]}] Streaming segment complete: {chunk_count} chunks")
+
+                    else:
+                        # Batch mode: full generation, higher quality
+                        audio_bytes = await _generate_batch(
+                            model, text, stream.language, speaker_idx
+                        )
+                        segment_bytes = len(audio_bytes)
+
+                        # Track first audio TTFB
+                        if first_audio_time is None:
+                            first_audio_time = time.time()
+                            ttfb = (first_audio_time - stream.created_at) * 1000
+                            logger.info(f"[{stream.stream_id[:8]}] First audio (batch), TTFB: {ttfb:.0f}ms")
+
+                        stream.record_audio_generated(segment_bytes)
+
+                        # Send audio in chunks via WebSocket
+                        chunk_size = 4096
+                        for i in range(0, segment_bytes, chunk_size):
+                            try:
+                                await websocket.send_bytes(audio_bytes[i : i + chunk_size])
+                            except Exception:
+                                return  # WebSocket closed
+
+                    # Signal segment complete to client
+                    segment_audio_ms = segment_bytes / (MAGPIE_SAMPLE_RATE * 2) * 1000
+                    try:
+                        await websocket.send_json({
+                            "type": "segment_complete",
+                            "segment": stream.segments_generated + 1,
+                            "audio_ms": segment_audio_ms,
+                        })
+                    except Exception:
+                        return  # WebSocket closed
+
                     stream.mark_segment_complete()
+                    continue  # Check for more segments immediately
 
-                    # Send audio in chunks via WebSocket
-                    chunk_size = 4096
-                    for i in range(0, len(audio_bytes), chunk_size):
-                        try:
-                            await websocket.send_bytes(audio_bytes[i : i + chunk_size])
-                        except Exception:
-                            return  # WebSocket closed
+                # Exit when closed/cancelled AND queue empty
+                if stream.state in (StreamState.CLOSED, StreamState.CANCELLED):
+                    async with queue_lock:
+                        if not segment_queue:
+                            break
 
-                    continue  # Check for more pending text immediately
-
-                # Exit when closed AND buffer empty AND queue empty
-                if stream.state == StreamState.CLOSED and not stream.text_buffer:
-                    break
-
-                # Yield to let receive loop run
-                await asyncio.sleep(0.01)
+                # Wait for new segments or check periodically
+                queue_event.clear()
+                try:
+                    await asyncio.wait_for(queue_event.wait(), timeout=0.01)
+                except asyncio.TimeoutError:
+                    pass
 
             stream.complete()
 
@@ -872,7 +942,8 @@ async def websocket_tts_stream(websocket: WebSocket):
             logger.debug(f"[{stream.stream_id[:8]}] WS audio task cancelled")
             raise
         except Exception as e:
-            logger.error(f"[{stream.stream_id[:8]}] WS audio generation error: {e}")
+            import traceback
+            logger.error(f"[{stream.stream_id[:8]}] WS audio generation error: {e}\n{traceback.format_exc()}")
             try:
                 await websocket.send_json({
                     "type": "error",
@@ -884,7 +955,6 @@ async def websocket_tts_stream(websocket: WebSocket):
             stream.set_error(str(e))
 
     try:
-        # DEBUG: Test with stream creation + text + audio task
         msg_count = 0
         loop_start = time.time()
 
@@ -902,41 +972,111 @@ async def websocket_tts_stream(websocket: WebSocket):
             # Log every message with timing
             if msg_type == "text":
                 text_preview = data.get("text", "")[:20]
-                logger.info(f"WS #{msg_count} @{elapsed:.0f}ms (wait:{wait_time:.0f}ms): text='{text_preview}'")
+                mode = data.get("mode", default_mode)
+                logger.info(f"WS #{msg_count} @{elapsed:.0f}ms (wait:{wait_time:.0f}ms): text='{text_preview}' mode={mode}")
             else:
                 logger.info(f"WS #{msg_count} @{elapsed:.0f}ms (wait:{wait_time:.0f}ms): type={msg_type}")
 
             if msg_type == "init":
                 voice = data.get("voice", "aria").lower()
                 language = data.get("language", "en").lower()
-                if stream is None:
-                    stream = await stream_manager.create_stream(voice=voice, language=language)
-                    await websocket.send_json({"type": "stream_created", "stream_id": stream.stream_id})
-                    logger.info(f"[{stream.stream_id[:8]}] Stream created, starting audio task...")
-                    # Start audio task - this should NOT block
-                    audio_task = asyncio.create_task(send_audio())
-                    logger.info(f"[{stream.stream_id[:8]}] Audio task started @{(time.time() - loop_start)*1000:.0f}ms")
+                default_mode = data.get("default_mode", "batch")
+
+                # Clean up any old stream/task from previous response
+                if audio_task is not None and not audio_task.done():
+                    logger.debug("Cancelling old audio_task for new init")
+                    audio_task.cancel()
+                    try:
+                        await asyncio.wait_for(audio_task, timeout=0.5)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        pass
+                if stream is not None:
+                    await stream_manager.remove_stream(stream.stream_id)
+                async with queue_lock:
+                    segment_queue.clear()
+
+                # Create fresh stream
+                stream = await stream_manager.create_stream(voice=voice, language=language)
+                await websocket.send_json({"type": "stream_created", "stream_id": stream.stream_id})
+                logger.info(f"[{stream.stream_id[:8]}] Stream created (default_mode={default_mode}), starting audio task...")
+                audio_task = asyncio.create_task(send_audio())
+                logger.info(f"[{stream.stream_id[:8]}] Audio task started @{(time.time() - loop_start)*1000:.0f}ms")
 
             elif msg_type == "text":
                 text = normalize_text(data.get("text", ""))
-                if stream is None:
+                mode = data.get("mode", default_mode)
+                preset = data.get("preset")  # Only used for stream mode
+
+                # Check if we need a new stream (first text, or previous stream closed/done)
+                need_new_stream = (
+                    stream is None or
+                    stream.state in (StreamState.CLOSED, StreamState.COMPLETED, StreamState.CANCELLED, StreamState.ERROR)
+                )
+
+                if need_new_stream:
+                    # Clean up any old stream/task
+                    if audio_task is not None and not audio_task.done():
+                        logger.debug("Cancelling old audio_task for new text")
+                        audio_task.cancel()
+                        try:
+                            await asyncio.wait_for(audio_task, timeout=0.5)
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            pass
+                    if stream is not None:
+                        await stream_manager.remove_stream(stream.stream_id)
+                    async with queue_lock:
+                        segment_queue.clear()
+
+                    # Create fresh stream
                     stream = await stream_manager.create_stream(voice=voice, language=language)
                     await websocket.send_json({"type": "stream_created", "stream_id": stream.stream_id})
                     audio_task = asyncio.create_task(send_audio())
+
                 if text.strip():
-                    stream.append_text(text)
+                    async with queue_lock:
+                        segment_queue.append((text, mode, preset))
+                    queue_event.set()
 
             elif msg_type == "close":
                 if stream:
                     stream.close()
-                # Wait for audio task to complete
+
+                # Signal the queue so audio_task can process remaining text and exit
+                queue_event.set()
+
+                # DON'T BLOCK waiting for audio_task here!
+                # Let it finish in the background. We'll clean up when:
+                # - audio_task completes naturally (sends "done", removes stream)
+                # - A new stream starts (we'll cancel old task if still running)
+                logger.debug(f"[{stream.stream_id[:8] if stream else 'none'}] Close received, audio continuing in background")
+
+            elif msg_type == "cancel":
+                # Immediate cancellation (for interruption handling)
+                # Unlike "close", this stops generation immediately
+                logger.debug(f"[{stream.stream_id[:8] if stream else 'none'}] Cancel received")
+
+                if stream:
+                    stream.cancel()  # Sets state to CANCELLED
+
                 if audio_task:
+                    audio_task.cancel()
                     try:
-                        await asyncio.wait_for(audio_task, timeout=30.0)
-                    except asyncio.TimeoutError:
-                        logger.warning("Audio task timeout on close")
-                        audio_task.cancel()
-                break
+                        # Brief wait - task exits quickly via CANCELLED state check
+                        await asyncio.wait_for(audio_task, timeout=0.1)
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        pass  # Task will clean up on its own
+
+                # Clear queue and reset state
+                async with queue_lock:
+                    segment_queue.clear()
+                if stream:
+                    await stream_manager.remove_stream(stream.stream_id)
+                stream = None
+                audio_task = None
+                queue_event.clear()
+
+            elif msg_type == "ping":
+                await websocket.send_json({"type": "pong"})
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket client disconnected" + (f" [{stream.stream_id[:8]}]" if stream else ""))
@@ -958,6 +1098,67 @@ async def websocket_tts_stream(websocket: WebSocket):
         # Cleanup
         if stream is not None:
             await stream_manager.remove_stream(stream.stream_id)
+
+
+def _generate_fade_out_tail(last_chunk: bytes, fade_ms: int = 20, sample_rate: int = MAGPIE_SAMPLE_RATE) -> bytes:
+    """Generate a fade-out tail based on the last chunk's ending amplitude.
+
+    Instead of modifying the last chunk (which would require buffering),
+    we generate a short fade-out that smoothly transitions from the
+    last sample value to silence.
+
+    Args:
+        last_chunk: The last audio chunk (16-bit PCM)
+        fade_ms: Fade-out duration in milliseconds
+        sample_rate: Audio sample rate
+
+    Returns:
+        A short fade-out audio tail
+    """
+    if not last_chunk or len(last_chunk) < 4:
+        return b""
+
+    # Get the last few samples from the chunk to determine ending amplitude
+    audio = np.frombuffer(last_chunk, dtype=np.int16).astype(np.float32)
+    if len(audio) < 4:
+        return b""
+
+    # Use average of last few samples as starting amplitude
+    end_amplitude = np.mean(audio[-4:])
+
+    # Generate fade-out from end_amplitude to 0
+    fade_samples = int(sample_rate * fade_ms / 1000)
+    fade_curve = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+    fade_audio = end_amplitude * fade_curve
+
+    return np.clip(fade_audio, -32768, 32767).astype(np.int16).tobytes()
+
+
+def _apply_fade_out(audio_bytes: bytes, fade_ms: int = 20, sample_rate: int = MAGPIE_SAMPLE_RATE) -> bytes:
+    """Apply fade-out to the end of audio to mask HiFiGAN artifacts.
+
+    Args:
+        audio_bytes: Raw PCM audio (16-bit signed, mono)
+        fade_ms: Fade-out duration in milliseconds
+        sample_rate: Audio sample rate
+
+    Returns:
+        Audio bytes with fade-out applied
+    """
+    if not audio_bytes:
+        return audio_bytes
+
+    fade_samples = int(sample_rate * fade_ms / 1000)
+    audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+
+    if len(audio) < fade_samples:
+        return audio_bytes
+
+    # Apply fade-out to last fade_ms
+    fade_curve = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
+    audio[-fade_samples:] *= fade_curve
+
+    return np.clip(audio, -32768, 32767).astype(np.int16).tobytes()
 
 
 async def _generate_batch(
@@ -987,13 +1188,103 @@ async def _generate_batch(
         audio_int16 = (audio_np * 32767).astype(np.int16)
         return audio_int16.tobytes()
 
-    return await asyncio.to_thread(_synthesize)
+    audio_bytes = await asyncio.to_thread(_synthesize)
+    # Apply fade-out to mask end-of-generation artifact
+    return _apply_fade_out(audio_bytes)
+
+
+async def _generate_streaming_with_preset(
+    model, text: str, language: str, speaker_idx: int, preset: str = "conservative",
+    cancel_event: Optional[threading.Event] = None
+) -> AsyncGenerator[bytes, None]:
+    """Generate audio using streaming mode with configurable preset.
+
+    Args:
+        preset: "aggressive" (~185ms TTFB), "balanced" (~280ms), "conservative" (~370ms, default)
+        cancel_event: If set, generation stops early (for interruption handling)
+    """
+    from nemotron_speech.streaming_tts import StreamingMagpieTTS, STREAMING_PRESETS
+    import queue
+
+    # Get preset config, default to conservative
+    # Make a copy to avoid mutating the shared preset
+    from dataclasses import replace
+    base_config = STREAMING_PRESETS.get(preset, STREAMING_PRESETS["conservative"])
+    config = replace(base_config,
+        use_cfg=True,       # Enable CFG for quality
+        use_crossfade=False # Disable crossfade - causes audio artifacts at chunk boundaries
+    )
+
+    chunk_queue: queue.Queue = queue.Queue()
+    generation_done = False
+    generation_error = None
+
+    def run_generation():
+        nonlocal generation_done, generation_error
+        try:
+            streamer = StreamingMagpieTTS(model, config)
+            for chunk in streamer.synthesize_streaming(
+                text,
+                language=language,
+                speaker_index=speaker_idx,
+                apply_tn=False,
+            ):
+                # Check for cancellation between chunks (~46ms granularity)
+                if cancel_event and cancel_event.is_set():
+                    logger.debug("Streaming generation cancelled")
+                    break
+                chunk_queue.put(chunk)
+        except Exception as e:
+            generation_error = e
+        finally:
+            chunk_queue.put(None)
+            generation_done = True
+
+    gen_thread = threading.Thread(target=run_generation, daemon=True)
+    gen_thread.start()
+
+    # Track last chunk to apply fade-out at the end
+    # We yield chunks immediately (no buffering) for low TTFB,
+    # then send a fade-out tail after the last chunk
+    last_chunk: bytes | None = None
+
+    while True:
+        try:
+            chunk = chunk_queue.get(timeout=0.001)
+            if chunk is None:
+                # Generation done - send fade-out tail based on last chunk
+                if last_chunk:
+                    yield _generate_fade_out_tail(last_chunk)
+                break
+            yield chunk
+            last_chunk = chunk
+        except queue.Empty:
+            if generation_done:
+                while True:
+                    try:
+                        chunk = chunk_queue.get_nowait()
+                        if chunk is None:
+                            # Send fade-out tail based on last chunk
+                            if last_chunk:
+                                yield _generate_fade_out_tail(last_chunk)
+                            break
+                        yield chunk
+                        last_chunk = chunk
+                    except queue.Empty:
+                        break
+                break
+            await asyncio.sleep(0)
+
+    gen_thread.join(timeout=10.0)
+
+    if generation_error:
+        raise generation_error
 
 
 async def _generate_streaming(
     model, text: str, language: str, speaker_idx: int
 ) -> AsyncGenerator[bytes, None]:
-    """Generate audio using streaming mode (frame-by-frame)."""
+    """Generate audio using streaming mode (frame-by-frame). DEPRECATED - use _generate_streaming_with_preset."""
     from nemotron_speech.streaming_tts import StreamingMagpieTTS, StreamingConfig
     import queue
     import threading

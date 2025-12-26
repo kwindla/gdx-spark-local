@@ -138,50 +138,39 @@ async def receive_llm_chunk(
 
 async def wait_for_tts_segment(
     tts_ws,
-    first_timeout_s: float = 10.0,
-    gap_timeout_ms: float = 150,
+    timeout_s: float = 10.0,
 ) -> tuple[bytes, Optional[float], float, bool]:
-    """Wait for TTS segment to complete using gap detection.
+    """Wait for TTS segment to complete using explicit server signal.
 
-    With TARGET_AUDIO_MS=500ms, TTS flushes almost immediately when text arrives.
-    We wait for first audio, then collect until a gap indicates segment is done.
+    Collects audio chunks until receiving a segment_complete or done message.
 
     Returns: (audio_bytes, first_audio_ts, done_ts, is_stream_complete)
     """
     audio_chunks = []
     first_audio_ts = None
 
-    # Phase 1: Wait for first audio (TTS generation takes ~300-600ms)
-    while first_audio_ts is None:
+    while True:
         try:
-            msg = await asyncio.wait_for(tts_ws.recv(), timeout=first_timeout_s)
+            msg = await asyncio.wait_for(tts_ws.recv(), timeout=timeout_s)
         except asyncio.TimeoutError:
-            # No audio generated - might be empty segment or threshold not reached
-            return b"", None, time.time(), False
+            # Timeout waiting for audio
+            return b"".join(audio_chunks), first_audio_ts, time.time(), False
 
         if isinstance(msg, bytes):
-            first_audio_ts = time.time()
+            if first_audio_ts is None:
+                first_audio_ts = time.time()
             audio_chunks.append(msg)
         else:
             data = json.loads(msg)
-            if data.get("type") == "done":
+            msg_type = data.get("type")
+            if msg_type == "segment_complete":
+                # Segment done, more may be coming
+                return b"".join(audio_chunks), first_audio_ts, time.time(), False
+            elif msg_type == "done":
+                # Stream complete
                 return b"".join(audio_chunks), first_audio_ts, time.time(), True
-            elif data.get("type") == "error":
+            elif msg_type == "error":
                 raise RuntimeError(f"TTS error: {data.get('message')}")
-
-    # Phase 2: Collect remaining audio until gap (segment boundary)
-    while True:
-        try:
-            msg = await asyncio.wait_for(tts_ws.recv(), timeout=gap_timeout_ms / 1000)
-            if isinstance(msg, bytes):
-                audio_chunks.append(msg)
-            else:
-                data = json.loads(msg)
-                if data.get("type") == "done":
-                    return b"".join(audio_chunks), first_audio_ts, time.time(), True
-        except asyncio.TimeoutError:
-            # Gap detected - segment complete, more may be coming
-            return b"".join(audio_chunks), first_audio_ts, time.time(), False
 
 
 def print_chunk_progress(metrics: ChunkMetrics, verbose: bool = False):
@@ -301,7 +290,7 @@ async def run_integration_test(verbose: bool = False, save_audio_path: Optional[
     print("=" * 80)
     print(f"\nSystem: {messages[0]['content'][:60]}...")
     print(f"User: {messages[-1]['content']}")
-    print(f"Strategy: max_tokens=10 (first), sentence_boundary (subsequent)")
+    print(f"Strategy: sentence_boundary with min=10, max=24 (first), sentence_boundary (subsequent)")
     print(f"\nLLM: {LLM_URI}")
     print(f"TTS: {TTS_URI}")
     print("\n" + "-" * 80)
@@ -331,7 +320,7 @@ async def run_integration_test(verbose: bool = False, save_audio_path: Optional[
                 "action": "start_stream",
                 "stream_id": stream_id,
                 "messages": messages,
-                "pause": {"max_tokens": 10},
+                "pause": {"sentence_boundary": True, "min_tokens": 10, "max_tokens": 24},
                 "stream_tokens": True
             }))
 
@@ -340,9 +329,17 @@ async def run_integration_test(verbose: bool = False, save_audio_path: Optional[
                 text, token_count, llm_first_token_ts, llm_done_ts, is_llm_done = \
                     await receive_llm_chunk(llm_ws, chunk_num, inference_start)
 
-                # Send text to TTS (don't close yet - more chunks may come)
+                # Send text to TTS with mode selection
+                # First chunk: streaming mode for fast TTFB
+                # Subsequent chunks: batch mode for quality
                 tts_text_sent_ts = time.time()
-                await tts_ws.send(json.dumps({"type": "text", "text": text}))
+                tts_mode = "stream" if chunk_num == 1 else "batch"
+                await tts_ws.send(json.dumps({
+                    "type": "text",
+                    "text": text,
+                    "mode": tts_mode,
+                    "preset": "conservative",  # ~370ms TTFB for streaming
+                }))
 
                 # If LLM is done, close TTS stream to flush any remaining buffer
                 if is_llm_done:
