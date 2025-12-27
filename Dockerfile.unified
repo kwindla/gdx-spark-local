@@ -1,0 +1,414 @@
+# Dockerfile.unified - Unified ASR + TTS + LLM container for DGX Spark (Blackwell GB10)
+#
+# Purpose: Single container with all services sharing one CUDA context
+# Base: CUDA 13.1.0 devel
+# PyTorch: Built from source with TORCH_CUDA_ARCH_LIST=12.1
+# Services:
+#   - ASR: Parakeet streaming ASR (NeMo) - port 8080
+#   - TTS: Magpie TTS multilingual (NeMo) - port 8001
+#   - LLM: llama.cpp (GGUF) or vLLM (BF16) - port 8000
+#
+# Build (takes 2-3 hours):
+#   docker build -f Dockerfile.unified -t nemotron-unified:cuda13 .
+#
+# Run (llama.cpp mode):
+#   docker run -d --name nemotron --gpus all --ipc=host \
+#     -v $(pwd):/workspace \
+#     -v ~/.cache/huggingface:/hf_cache:ro \
+#     -p 8000:8000 -p 8001:8001 -p 8080:8080 \
+#     -e LLAMA_MODEL=/hf_cache/hub/models--unsloth--Nemotron-3-Nano-30B-A3B-GGUF/snapshots/.../Q8_0.gguf \
+#     -e HUGGINGFACE_ACCESS_TOKEN=$HUGGINGFACE_ACCESS_TOKEN \
+#     nemotron-unified:cuda13 \
+#     bash /workspace/scripts/start_unified.sh
+#
+# Run (vLLM mode):
+#   docker run -d --name nemotron --gpus all --ipc=host \
+#     -v $(pwd):/workspace \
+#     -v $(pwd)/models:/workspace/models:ro \
+#     -p 8000:8000 -p 8001:8001 -p 8080:8080 \
+#     -e LLM_MODE=vllm \
+#     -e VLLM_MODEL=/workspace/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
+#     nemotron-unified:cuda13 \
+#     bash /workspace/scripts/start_unified.sh
+
+FROM nvidia/cuda:13.1.0-devel-ubuntu24.04
+
+LABEL maintainer="nemotron-speech"
+LABEL description="Unified ASR + TTS + LLM container for CUDA 13.1 sm_121 (DGX Spark)"
+LABEL version="1.0"
+
+# Prevent interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+# =============================================================================
+# Phase 1: System Dependencies (union of ASR + vLLM + llama.cpp requirements)
+# =============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 \
+    python3.12-dev \
+    python3.12-venv \
+    python3-pip \
+    git \
+    curl \
+    wget \
+    cmake \
+    ninja-build \
+    ccache \
+    libopenblas-dev \
+    libomp-dev \
+    libffi-dev \
+    libssl-dev \
+    libnuma-dev \
+    libcurl4-openssl-dev \
+    ffmpeg \
+    sox \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3 /usr/bin/python
+
+# Install uv for fast package management
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+ENV UV_SYSTEM_PYTHON=1
+ENV UV_BREAK_SYSTEM_PACKAGES=1
+
+# =============================================================================
+# Phase 2: CUDA Libraries (cuDNN + NCCL from NGC PyTorch container)
+# =============================================================================
+# cuDNN (required for PyTorch CUDA)
+COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/lib/aarch64-linux-gnu/libcudnn* /usr/lib/aarch64-linux-gnu/
+COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/include/cudnn* /usr/include/
+
+# NCCL (required for PyTorch distributed/NeMo)
+COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/lib/aarch64-linux-gnu/libnccl* /usr/lib/aarch64-linux-gnu/
+COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/include/nccl.h /usr/include/
+COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/include/nccl_device.h /usr/include/
+COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/include/nccl_device/ /usr/include/nccl_device/
+
+# Verify and update library cache
+RUN echo "=== Verifying CUDA libraries ===" && \
+    ls -la /usr/lib/aarch64-linux-gnu/libcudnn* | head -3 && \
+    ls -la /usr/lib/aarch64-linux-gnu/libnccl* | head -3 && \
+    ls -la /usr/include/nccl.h && \
+    ldconfig
+
+# =============================================================================
+# Phase 3: PyTorch Build Dependencies
+# =============================================================================
+RUN uv pip install --no-cache \
+    numpy \
+    pyyaml \
+    typing_extensions \
+    sympy \
+    filelock \
+    networkx \
+    jinja2 \
+    fsspec \
+    packaging \
+    setuptools \
+    wheel \
+    cffi \
+    future \
+    requests \
+    dataclasses \
+    pillow \
+    expecttest \
+    hypothesis \
+    pytest
+
+# =============================================================================
+# Phase 4: Build PyTorch from Source (for CUDA 13.1 sm_121 support)
+# =============================================================================
+# PyTorch - main branch, 2025-12-26
+# Includes CUDA 13.1 support required for sm_121 (Blackwell/GB10)
+ARG PYTORCH_COMMIT=32cb1dac896fe212d77073a4a53fee840c13442f
+
+WORKDIR /build
+
+# Clone PyTorch and checkout specific commit for reproducibility
+RUN git clone --recursive https://github.com/pytorch/pytorch.git && \
+    cd pytorch && git checkout ${PYTORCH_COMMIT}
+
+WORKDIR /build/pytorch
+
+# Update submodules to match the pinned commit
+RUN git submodule sync && git submodule update --init --recursive
+
+# Set build environment for sm_121 (GB10/Blackwell)
+ENV TORCH_CUDA_ARCH_LIST="12.1"
+ENV USE_CUDA=1
+ENV USE_CUDNN=1
+ENV USE_MKLDNN=1
+ENV USE_DISTRIBUTED=1
+ENV USE_NCCL=1
+ENV USE_TENSORPIPE=0
+ENV USE_SYSTEM_NCCL=1
+ENV NCCL_ROOT=/usr
+ENV NCCL_LIB_DIR=/usr/lib/aarch64-linux-gnu
+ENV NCCL_INCLUDE_DIR=/usr/include
+ENV BUILD_TEST=0
+ENV MAX_JOBS=8
+ENV CMAKE_BUILD_TYPE=Release
+ENV CUDNN_LIB_DIR=/usr/lib/aarch64-linux-gnu
+ENV CUDNN_INCLUDE_DIR=/usr/include
+ENV USE_PRIORITIZED_TEXT_FOR_LD=1
+
+# Create symlinks for CUB/Thrust from CCCL (CUDA 13.1 layout)
+RUN ln -sf /usr/local/cuda/include/cccl/cub /usr/local/cuda/include/cub && \
+    ln -sf /usr/local/cuda/include/cccl/thrust /usr/local/cuda/include/thrust && \
+    echo "=== Verifying CUB access ===" && \
+    ls /usr/local/cuda/include/cub/cub.cuh && \
+    ls /usr/local/cuda/include/cccl/cub/cub.cuh
+
+# Build and install PyTorch, save wheel for potential reinstallation
+ENV CUB_INCLUDE_DIR=/usr/local/cuda/include/cccl
+RUN python3 setup.py bdist_wheel && \
+    uv pip install --no-cache dist/*.whl && \
+    mkdir -p /tmp/pytorch_wheel && \
+    cp dist/*.whl /tmp/pytorch_wheel/
+
+# =============================================================================
+# Phase 5: Build torchaudio from Source (required for NeMo ASR)
+# =============================================================================
+# torchaudio - main branch, 2025-12-20
+# Compatible with PyTorch main branch
+ARG TORCHAUDIO_COMMIT=0764cfdedb769e63f3ab8b90bc06541a6a2c0b73
+
+WORKDIR /build
+
+RUN git clone --recursive https://github.com/pytorch/audio.git && \
+    cd audio && git checkout ${TORCHAUDIO_COMMIT}
+
+WORKDIR /build/audio
+
+ENV BUILD_SOX=0
+ENV USE_CUDA=1
+
+RUN python3 setup.py bdist_wheel && \
+    uv pip install --no-cache dist/*.whl && \
+    mkdir -p /tmp/torchaudio_wheel && \
+    cp dist/*.whl /tmp/torchaudio_wheel/
+
+# =============================================================================
+# Cleanup PyTorch/torchaudio build artifacts to save space
+# =============================================================================
+WORKDIR /workspace
+RUN rm -rf /build/pytorch /build/audio
+
+# =============================================================================
+# Phase 6: NeMo Installation (ASR + TTS)
+# =============================================================================
+# NeMo - main branch, 2025-12-23
+# Includes MagpieTTS longform support (not in r2.6.0 release)
+ARG NEMO_COMMIT=644201898480ec8c8d0a637f0c773825509ac4dc
+RUN git clone https://github.com/NVIDIA/NeMo.git /opt/nemo && \
+    cd /opt/nemo && git checkout ${NEMO_COMMIT}
+
+# Install NeMo ASR + TTS dependencies
+RUN uv pip install --no-cache \
+    Cython \
+    hydra-core>=1.3.0 \
+    omegaconf>=2.3 \
+    pytorch-lightning>=2.0 \
+    torchmetrics>=0.11.0 \
+    transformers>=4.36.0 \
+    sentencepiece \
+    webdataset \
+    lhotse>=1.20.0 \
+    braceexpand \
+    editdistance \
+    g2p_en \
+    inflect \
+    kaldi-python-io \
+    kaldiio \
+    librosa>=0.10.0 \
+    marshmallow \
+    ruamel.yaml \
+    soundfile \
+    text-unidecode \
+    numba \
+    kaldialign
+
+# Install NeMo from source with ASR and TTS support
+RUN cd /opt/nemo && uv pip install --no-cache -e ".[asr,tts]"
+
+# Patch NeMo NVRTC for dynamic GPU architecture detection (required for sm_121)
+COPY <<'EOF' /tmp/patch_nvrtc.py
+import re
+
+with open('/opt/nemo/nemo/core/utils/cuda_python_utils.py', 'r') as f:
+    content = f.read()
+
+# Find and replace the opts = [] pattern
+old_pattern = r'(\s+)opts = \[\]\n(\s+)\(err,\) = nvrtc\.nvrtcCompileProgram'
+new_code = r'''\1# Detect GPU architecture for sm_121 (GB10) support
+\1import torch
+\1if torch.cuda.is_available():
+\1    major, minor = torch.cuda.get_device_capability(0)
+\1    arch = major * 10 + minor
+\1    opts = [f"--gpu-architecture=compute_{arch}".encode()]
+\1else:
+\1    opts = []
+\2(err,) = nvrtc.nvrtcCompileProgram'''
+
+content = re.sub(old_pattern, new_code, content)
+
+with open('/opt/nemo/nemo/core/utils/cuda_python_utils.py', 'w') as f:
+    f.write(content)
+
+print("NeMo NVRTC patched for dynamic GPU architecture detection")
+EOF
+RUN python3 /tmp/patch_nvrtc.py || echo "Patch may have already been applied"
+
+# =============================================================================
+# Phase 7: vLLM Installation (for BF16 full-weights mode)
+# =============================================================================
+# Install vLLM dependencies
+RUN uv pip install --no-cache \
+    tokenizers>=0.19 \
+    fastapi \
+    uvicorn[standard] \
+    pydantic>=2.0 \
+    prometheus_client \
+    py-cpuinfo \
+    tiktoken \
+    lm-format-enforcer \
+    outlines \
+    xgrammar \
+    pyzmq \
+    msgspec \
+    gguf \
+    compressed-tensors \
+    importlib_metadata \
+    mistral_common>=1.5.0 \
+    partial-json-parser
+
+# vLLM - main branch, 2025-12-21
+# Same commit as working vllm:cuda13-full container (supports Nemotron-H relu2_no_mul)
+ARG VLLM_COMMIT=bb80f69bc98cbf062bf030cb11185f7ba526e28a
+ARG VLLM_CACHE_BUSTER=v1
+
+WORKDIR /build
+
+# Clone vLLM and checkout specific commit for reproducibility
+RUN git clone https://github.com/vllm-project/vllm.git && \
+    cd vllm && git checkout ${VLLM_COMMIT}
+
+WORKDIR /build/vllm
+
+# Set vLLM build environment for sm_121 (matching Dockerfile.vllm-cuda13-build)
+ENV TORCH_CUDA_ARCH_LIST="12.1"
+ENV VLLM_TARGET_DEVICE="cuda"
+ENV MAX_JOBS=8
+
+# Install vLLM build dependencies (matching Dockerfile.vllm-cuda13-build)
+RUN uv pip install --no-cache \
+    cmake>=3.26 \
+    ninja \
+    packaging \
+    setuptools>=61 \
+    setuptools-scm>=8 \
+    wheel \
+    jinja2
+
+# Build and install vLLM in editable mode (matching Dockerfile.vllm-cuda13-build)
+RUN uv pip install --no-cache -e . --no-build-isolation
+
+# Reinstall our custom PyTorch (vLLM may have replaced it)
+# Also remove torchvision/torchaudio which vLLM may have installed
+RUN uv pip uninstall torchvision torchaudio || true && \
+    uv pip install --no-cache --reinstall /tmp/pytorch_wheel/torch*.whl
+
+# Rebuild torchaudio (must match our custom PyTorch)
+# Uses same TORCHAUDIO_COMMIT as Phase 5
+WORKDIR /build
+RUN git clone --recursive https://github.com/pytorch/audio.git torchaudio-rebuild && \
+    cd torchaudio-rebuild && git checkout ${TORCHAUDIO_COMMIT} && \
+    BUILD_SOX=0 USE_CUDA=1 python3 setup.py bdist_wheel && \
+    uv pip install --no-cache dist/*.whl && \
+    cd .. && rm -rf torchaudio-rebuild
+
+# Install triton and fix ptxas for sm_121a support
+RUN uv pip install --no-cache triton && \
+    rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
+    ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas
+
+# =============================================================================
+# Phase 8: Build llama.cpp from Source (for GGUF quantized mode)
+# =============================================================================
+# llama.cpp - using the same approach as Dockerfile.vllm-llamacpp
+# Uses cmake flags from the working container build.
+# Note: sm_121a (with 'a' suffix) enables architecture-accelerated features.
+#
+# Pinned to commit c18428423018ed214c004e6ecaedb0cbdda06805 (Dec 24, 2025)
+# which is the version in the working vllm-llamacpp:cuda13 container.
+ARG LLAMACPP_COMMIT=c18428423018ed214c004e6ecaedb0cbdda06805
+RUN git clone https://github.com/ggerganov/llama.cpp.git /opt/llama.cpp && \
+    cd /opt/llama.cpp && git checkout ${LLAMACPP_COMMIT} && \
+    cmake -B build \
+        -DGGML_CUDA=ON \
+        -DGGML_CUDA_F16=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="121a" \
+        -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build --config Release -j$(nproc) && \
+    # Install binaries to /usr/local
+    cp build/bin/llama-server /usr/local/bin/ && \
+    cp build/bin/llama-cli /usr/local/bin/ && \
+    cp build/bin/llama-quantize /usr/local/bin/ && \
+    cp build/bin/llama-bench /usr/local/bin/ && \
+    # Copy shared libraries
+    cp build/bin/*.so* /usr/local/lib/ 2>/dev/null || true && \
+    ldconfig && \
+    # Clean up build artifacts
+    rm -rf /opt/llama.cpp/build && \
+    rm -rf /opt/llama.cpp/.git
+
+# Verify llama.cpp installation
+RUN llama-server --version || echo "llama-server installed (version check requires GPU)"
+
+# =============================================================================
+# Phase 9: Cleanup build artifacts
+# =============================================================================
+WORKDIR /workspace
+# Keep /build/vllm for editable install (matching Dockerfile.vllm-cuda13-build)
+RUN rm -rf /tmp/pytorch_wheel /tmp/torchaudio_wheel && \
+    rm -f /tmp/patch_nvrtc.py
+
+# =============================================================================
+# Phase 10: Application Dependencies
+# =============================================================================
+RUN uv pip install --no-cache \
+    websockets>=12.0 \
+    loguru>=0.7.0 \
+    httpx>=0.25.0
+
+# =============================================================================
+# Phase 11: Application Code
+# =============================================================================
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+RUN uv pip install --no-cache -e .
+
+# =============================================================================
+# Environment Configuration
+# =============================================================================
+ENV PYTHONUNBUFFERED=1
+ENV NEMO_CACHE_DIR=/workspace/.nemo_cache
+ENV VLLM_LOGGING_LEVEL=INFO
+ENV HF_HOME=/workspace/.cache/huggingface
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+# Disable libuv (not built into our custom PyTorch)
+ENV USE_LIBUV=0
+
+# Create model directory
+RUN mkdir -p /workspace/models
+
+# Expose all service ports
+EXPOSE 8000 8001 8080
+
+# Healthcheck to verify Python and key packages are working
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD python -c "import torch; import nemo; import websockets; print('ok')" || exit 1
+
+# Default command shows help
+CMD ["echo", "Use scripts/start_unified.sh to start all services. See docs/unified-container-plan.md for details."]
