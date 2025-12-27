@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 #
-# Pipecat bot using local NVIDIA ASR/LLM/TTS.
+# Pipecat bot using local NVIDIA ASR/TTS with vLLM for LLM.
 #
-# Based on pipecat/examples/foundational/07-interruptible.py (v0.0.98)
+# Based on bot.py but simplified to only use vLLM (OpenAI-compatible API).
 #
 # Usage:
-#   uv run pipecat_bots/bot.py
-#   uv run pipecat_bots/bot.py -t daily
-#   uv run pipecat_bots/bot.py -t webrtc
+#   uv run pipecat_bots/bot_vllm.py
+#   uv run pipecat_bots/bot_vllm.py -t daily
+#   uv run pipecat_bots/bot_vllm.py -t webrtc
 #
 # Environment variables (loaded from .env):
 #   NVIDIA_ASR_URL - ASR WebSocket URL (default: ws://localhost:8080)
-#   NVIDIA_LLM_URL - LLM API URL for OpenAI-compat (default: http://localhost:8000/v1)
-#   NVIDIA_LLAMA_CPP_URL - llama.cpp native API URL (default: http://localhost:8000)
-#   NVIDIA_LLM_MODEL - LLM model name (default: /workspace/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
+#   NVIDIA_LLM_URL - vLLM API URL (default: http://localhost:8000/v1)
+#   NVIDIA_LLM_MODEL - LLM model name (default: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
 #   NVIDIA_TTS_URL - Magpie TTS server URL (default: http://localhost:8001)
 #   USE_LOCAL_TTS - Use local Magpie TTS instead of Cartesia (default: true)
 #   USE_WEBSOCKET_TTS - Use WebSocket adaptive TTS (default: false)
-#   USE_CHUNKED_LLM - Use chunked LLM for sentence-boundary streaming (default: false)
 #   CARTESIA_API_KEY - Cartesia TTS API key (required if USE_LOCAL_TTS=false)
 #
 
@@ -47,7 +45,6 @@ from pipecat.services.openai.llm import OpenAILLMService
 from nvidia_stt import NVidiaWebSocketSTTService
 from magpie_http_tts import MagpieHTTPTTSService  # HTTP client for Magpie TTS server (batch)
 from magpie_websocket_tts import MagpieWebSocketTTSService  # WebSocket adaptive TTS
-from llama_cpp_chunked_llm import LlamaCppChunkedLLMService  # Direct llama.cpp chunked LLM
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
@@ -60,10 +57,8 @@ NVIDIA_ASR_URL = os.getenv("NVIDIA_ASR_URL", "ws://localhost:8080")
 NVIDIA_LLM_URL = os.getenv("NVIDIA_LLM_URL", "http://localhost:8000/v1")
 NVIDIA_LLM_MODEL = os.getenv(
     "NVIDIA_LLM_MODEL",
-    "/workspace/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 )
-# For LlamaCppChunkedLLMService - direct llama.cpp HTTP API (not /v1)
-NVIDIA_LLAMA_CPP_URL = os.getenv("NVIDIA_LLAMA_CPP_URL", "http://localhost:8000")
 NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
 
 # TTS configuration
@@ -71,30 +66,25 @@ NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
 USE_LOCAL_TTS = os.getenv("USE_LOCAL_TTS", "true").lower() in ("true", "1", "yes")
 # Set USE_WEBSOCKET_TTS=true for WebSocket-based adaptive streaming
 USE_WEBSOCKET_TTS = os.getenv("USE_WEBSOCKET_TTS", "false").lower() in ("true", "1", "yes")
-# Set USE_CHUNKED_LLM=true for sentence-boundary chunking (best with USE_WEBSOCKET_TTS)
-USE_CHUNKED_LLM = os.getenv("USE_CHUNKED_LLM", "false").lower() in ("true", "1", "yes")
 
 # Transport configurations with VAD and turn analyzer
-# stop_secs=0.34 aligns with ASR model's trailing context requirements:
-# - At 16kHz/20ms chunks, 340ms VAD silence = ~320ms at server (minus triggering chunk)
-# - ASR needs (right_context+1)*160ms = 320ms trailing silence for finalization
 transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
 }
@@ -112,20 +102,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         tts_mode = "cloud"
         tts_type = "Cartesia (cloud)"
 
-    # Determine LLM mode
-    if USE_CHUNKED_LLM:
-        llm_mode = "chunked"
-        llm_url = NVIDIA_LLAMA_CPP_URL
-    else:
-        llm_mode = "standard"
-        llm_url = NVIDIA_LLM_URL
-
-    logger.info(f"Starting bot (local ASR, {llm_mode} LLM, {tts_type} TTS)")
+    logger.info(f"Starting bot (local ASR, vLLM, {tts_type} TTS)")
     logger.info(f"  ASR URL: {NVIDIA_ASR_URL}")
-    logger.info(f"  LLM Mode: {llm_mode}")
-    logger.info(f"  LLM URL: {llm_url}")
-    if not USE_CHUNKED_LLM:
-        logger.info(f"  LLM Model: {NVIDIA_LLM_MODEL}")
+    logger.info(f"  LLM URL: {NVIDIA_LLM_URL}")
+    logger.info(f"  LLM Model: {NVIDIA_LLM_MODEL}")
     logger.info(f"  TTS: {tts_type}")
     logger.info(f"  Transport: {type(transport).__name__}")
 
@@ -139,19 +119,16 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     if USE_LOCAL_TTS:
         if USE_WEBSOCKET_TTS:
             # WebSocket Magpie TTS - full-duplex adaptive streaming
-            # Enable adaptive mode when using chunked LLM for optimal latency
             tts = MagpieWebSocketTTSService(
                 server_url=NVIDIA_TTS_URL,
                 voice="aria",
                 language="en",
                 params=MagpieWebSocketTTSService.InputParams(
                     language="en",
-                    streaming_preset="conservative",  # ~370ms TTFB for first chunk
-                    use_adaptive_mode=USE_CHUNKED_LLM,  # Enable when using chunked LLM
+                    streaming_preset="conservative",
                 ),
             )
-            mode_desc = "adaptive" if USE_CHUNKED_LLM else "batch-only"
-            logger.info(f"Using WebSocket Magpie TTS (full-duplex, {mode_desc})")
+            logger.info("Using WebSocket Magpie TTS (full-duplex)")
         else:
             # Batch Magpie TTS via HTTP server
             tts = MagpieHTTPTTSService(
@@ -167,34 +144,22 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22",  # British Lady
         )
 
-    # LLM service selection
-    if USE_CHUNKED_LLM:
-        # Chunked LLM - sentence-boundary streaming direct to llama.cpp
-        # Best paired with USE_WEBSOCKET_TTS for adaptive mode switching
-        llm = LlamaCppChunkedLLMService(
-            llama_url=NVIDIA_LLAMA_CPP_URL,
-            params=LlamaCppChunkedLLMService.InputParams(
-                first_chunk_min_tokens=10,
-                first_chunk_max_tokens=24,
-            ),
-        )
-        logger.info("Using LlamaCppChunkedLLMService (direct llama.cpp)")
-    else:
-        # Standard OpenAI-compatible LLM via vLLM
-        llm = OpenAILLMService(
-            api_key=os.getenv("NVIDIA_LLM_API_KEY", "not-needed"),
-            base_url=NVIDIA_LLM_URL,
-            model=NVIDIA_LLM_MODEL,
-            params=OpenAILLMService.InputParams(
-                extra={
-                    # extra_body passes vLLM-specific params in the request body
-                    "extra_body": {
-                        # Disable reasoning mode for faster responses
-                        "chat_template_kwargs": {"enable_thinking": False}
-                    }
+    # vLLM via OpenAI-compatible API
+    llm = OpenAILLMService(
+        api_key=os.getenv("NVIDIA_LLM_API_KEY", "not-needed"),
+        base_url=NVIDIA_LLM_URL,
+        model=NVIDIA_LLM_MODEL,
+        params=OpenAILLMService.InputParams(
+            extra={
+                # extra_body passes vLLM-specific params in the request body
+                "extra_body": {
+                    # Disable reasoning mode for faster responses
+                    "chat_template_kwargs": {"enable_thinking": False}
                 }
-            )
+            }
         )
+    )
+    logger.info("Using vLLM via OpenAILLMService (thinking disabled)")
 
     messages = [
         {

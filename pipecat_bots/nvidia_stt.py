@@ -63,6 +63,10 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         self._websocket = None
         self._receive_task: Optional[asyncio.Task] = None
         self._ready = False
+        # Lock to ensure any in-progress audio send completes before reset
+        self._audio_send_lock = asyncio.Lock()
+        # Diagnostic: track audio bytes sent since last reset
+        self._audio_bytes_sent = 0
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics."""
@@ -83,6 +87,8 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         Args:
             frame: The end frame.
         """
+        # Send final reset to ensure any buffered audio is transcribed
+        await self._send_reset()
         await super().stop(frame)
         await self._disconnect()
 
@@ -106,7 +112,9 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         """
         if self._websocket and self._ready:
             try:
-                await self._websocket.send(audio)
+                async with self._audio_send_lock:
+                    self._audio_bytes_sent += len(audio)
+                    await self._websocket.send(audio)
             except Exception as e:
                 logger.error(f"{self} failed to send audio: {e}")
                 await self._report_error(ErrorFrame(f"Failed to send audio: {e}"))
@@ -121,17 +129,27 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         """
         await super().process_frame(frame, direction)
 
-        # Trigger transcript finalization on VAD silence detection (200ms)
-        # This fires BEFORE Smart Turn analysis, giving us earlier final transcripts
+        # Trigger transcript finalization on VAD silence detection.
+        # VAD fires after ~200ms of silence, so all speech audio has already
+        # been sent. The server adds 480ms silence padding for trailing context.
         if isinstance(frame, VADUserStoppedSpeakingFrame):
             await self._send_reset()
 
     async def _send_reset(self):
-        """Send reset signal to trigger final transcription."""
+        """Send reset signal to trigger final transcription.
+
+        Acquires audio_send_lock to ensure any in-progress audio send completes
+        before the reset signal is sent.
+        """
         if self._websocket and self._ready:
             try:
-                await self._websocket.send(json.dumps({"type": "reset"}))
-                logger.debug(f"{self} sent reset signal")
+                async with self._audio_send_lock:
+                    await self._websocket.send(json.dumps({"type": "reset"}))
+                    # Log inside lock to get accurate byte count
+                    samples = self._audio_bytes_sent // 2
+                    duration_ms = (samples * 1000) // 16000
+                    logger.debug(f"{self} sent reset (audio: {duration_ms}ms)")
+                    self._audio_bytes_sent = 0
             except Exception as e:
                 logger.error(f"{self} failed to send reset: {e}")
 

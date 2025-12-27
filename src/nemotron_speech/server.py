@@ -129,10 +129,39 @@ class ASRServer:
         # drop_extra_pre_encoded for non-first chunks
         self.drop_extra = scfg.drop_extra_pre_encoded
 
+        # Calculate silence padding for final chunk:
+        # - right_context chunks for encoder lookahead
+        # - 1 additional chunk for decoder finalization
+        # With right_context=1, this is (1+1)*160ms = 320ms
+        self.final_padding_frames = (self.right_context + 1) * self.shift_frames
+        padding_ms = self.final_padding_frames * hop_length_sec * 1000
+
         shift_ms = self.shift_frames * hop_length_sec * 1000
         logger.info(f"Model loaded: {type(self.model).__name__}")
         logger.info(f"Shift size: {shift_ms:.0f}ms ({self.shift_frames} frames)")
         logger.info(f"Pre-encode cache: {self.pre_encode_cache_size} frames")
+        logger.info(f"Final chunk padding: {padding_ms:.0f}ms ({self.final_padding_frames} frames)")
+
+        # Warmup inference to ensure model is fully loaded on GPU
+        # This prevents GPU memory issues when LLM starts later
+        self._warmup()
+
+    def _warmup(self):
+        """Run warmup inference to claim GPU memory before LLM starts."""
+        import time
+
+        logger.info("Running warmup inference to claim GPU memory...")
+        start = time.perf_counter()
+
+        # Generate 1 second of silence for warmup
+        warmup_audio = np.zeros(self.sample_rate, dtype=np.float32)
+
+        # Run transcription to force all CUDA kernels to compile
+        with torch.no_grad():
+            _ = self.model.transcribe([warmup_audio], batch_size=1)
+
+        elapsed = (time.perf_counter() - start) * 1000
+        logger.info(f"Warmup complete in {elapsed:.0f}ms - GPU memory claimed")
 
     def _init_session(self, session: ASRSession):
         """Initialize a fresh session."""
@@ -219,6 +248,7 @@ class ASRServer:
 
             if text is not None and text != session.current_text:
                 session.current_text = text
+                logger.debug(f"Session {session.id} interim: {text[-50:] if len(text) > 50 else text}")
                 await session.websocket.send(json.dumps({
                     "type": "transcript",
                     "text": text,
@@ -307,14 +337,34 @@ class ASRServer:
 
     async def _reset_session(self, session: ASRSession):
         """Finalize and reset session."""
-        # Process all remaining audio with keep_all_outputs=True
+        # Log audio state at reset for diagnostics
+        audio_samples = len(session.accumulated_audio)
+        audio_duration_ms = (audio_samples * 1000) // self.sample_rate
+        logger.debug(
+            f"Session {session.id} reset received: "
+            f"accumulated={audio_samples} samples ({audio_duration_ms}ms), "
+            f"emitted={session.emitted_frames} frames"
+        )
+
+        # Pad with silence to ensure the model has enough trailing context
+        # to finalize the last word. Padding = (right_context + 1) * shift_frames.
         if len(session.accumulated_audio) > 0:
+            padding_samples = self.final_padding_frames * self.hop_samples
+            silence_padding = np.zeros(padding_samples, dtype=np.float32)
+            session.accumulated_audio = np.concatenate([session.accumulated_audio, silence_padding])
+
+        # Process all remaining audio with keep_all_outputs=True
+        import time
+        if len(session.accumulated_audio) > 0:
+            start_time = time.perf_counter()
             async with self.inference_lock:
                 text = await asyncio.get_event_loop().run_in_executor(
                     None, self._process_final_chunk, session
                 )
                 if text is not None:
                     session.current_text = text
+            elapsed_ms = (time.perf_counter() - start_time) * 1000
+            logger.debug(f"Session {session.id} final chunk processed in {elapsed_ms:.1f}ms")
 
         # Send final transcript
         await session.websocket.send(json.dumps({
@@ -323,7 +373,7 @@ class ASRServer:
             "is_final": True
         }))
 
-        logger.debug(f"Session {session.id} reset, emitted {session.emitted_frames} frames, final: {session.current_text[:50]}...")
+        logger.debug(f"Session {session.id} reset complete, final: '{session.current_text[:50]}...'")
 
         # Reinitialize
         async with self.inference_lock:
@@ -348,9 +398,17 @@ class ASRServer:
                 )
 
                 # For final chunk, use ALL remaining frames (including edge)
-                remaining_frames = mel.shape[-1] - session.emitted_frames
+                total_mel_frames = mel.shape[-1]
+                remaining_frames = total_mel_frames - session.emitted_frames
+
+                logger.debug(
+                    f"Session {session.id} final chunk: "
+                    f"total_mel={total_mel_frames}, emitted={session.emitted_frames}, "
+                    f"remaining={remaining_frames}"
+                )
 
                 if remaining_frames <= 0:
+                    logger.warning(f"Session {session.id}: No remaining frames to process!")
                     return session.current_text
 
                 # Extract final chunk with pre-encode cache
@@ -387,12 +445,18 @@ class ASRServer:
                 if transcribed_texts and transcribed_texts[0]:
                     hyp = transcribed_texts[0]
                     if hasattr(hyp, 'text'):
-                        return hyp.text
+                        final_text = hyp.text
                     elif isinstance(hyp, str):
-                        return hyp
+                        final_text = hyp
                     else:
-                        return str(hyp)
+                        final_text = str(hyp)
+                    logger.debug(
+                        f"Session {session.id} final chunk output: '{final_text[-50:] if len(final_text) > 50 else final_text}' "
+                        f"(was: '{session.current_text[-30:] if len(session.current_text) > 30 else session.current_text}')"
+                    )
+                    return final_text
 
+                logger.debug(f"Session {session.id} final chunk: no new text from model")
                 return session.current_text
 
         except Exception as e:
