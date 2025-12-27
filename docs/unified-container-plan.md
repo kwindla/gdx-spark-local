@@ -24,7 +24,7 @@ This document describes the plan to combine the three services (ASR, TTS, LLM) c
 **HUGGINGFACE_ACCESS_TOKEN Required**: The TTS model (nvidia/magpie_tts_multilingual_357m) is a gated model requiring authentication. Set the token before starting:
 ```bash
 export HUGGINGFACE_ACCESS_TOKEN=$(cat ~/.cache/huggingface/token)
-./scripts/nemotron.sh start --model /path/to/model.gguf
+./scripts/nemotron.sh start
 ```
 
 Or ensure the token is available in the environment when running the container.
@@ -291,7 +291,7 @@ The host-side wrapper manages the Docker container lifecycle.
 
 **Start Options:**
 - `--mode MODE` - LLM mode: `llamacpp-q8`, `llamacpp-q4`, `vllm`
-- `--model PATH` - Model path (GGUF file or HF model ID)
+- `--model PATH` - Model path (optional; auto-detects from HuggingFace cache)
 - `--no-asr`, `--no-tts`, `--no-llm` - Disable services
 - `-f` / `--foreground` - Run in foreground instead of detached
 
@@ -425,17 +425,17 @@ docker build -f Dockerfile.unified -t nemotron-unified:cuda13 .
 
 ### Run with nemotron.sh (Recommended)
 
-The `scripts/nemotron.sh` wrapper manages the container lifecycle from the host:
+The `scripts/nemotron.sh` wrapper manages the container lifecycle from the host. Models are auto-detected from the HuggingFace cache:
 
 ```bash
-# Start with llama.cpp Q8 (default)
-./scripts/nemotron.sh start --model ~/.cache/huggingface/hub/models--unsloth--Nemotron-3-Nano-30B-A3B-GGUF/snapshots/.../Q8_0.gguf
+# Start with llama.cpp Q8 (default) - auto-detects model
+./scripts/nemotron.sh start
 
-# Start with llama.cpp Q4
-./scripts/nemotron.sh start --mode llamacpp-q4 --model ~/.cache/huggingface/.../Q4_K_M.gguf
+# Start with llama.cpp Q4 - auto-detects model
+./scripts/nemotron.sh start --mode llamacpp-q4
 
-# Start with vLLM
-./scripts/nemotron.sh start --mode vllm --model nvidia/Nemotron-3-Nano-30B-A3B
+# Start with vLLM - uses nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 by default
+./scripts/nemotron.sh start --mode vllm
 
 # Start ASR + TTS only (no LLM)
 ./scripts/nemotron.sh start --no-llm
@@ -501,7 +501,7 @@ docker run -d --name nemotron --gpus all --ipc=host \
 
 4. Start unified container:
    ```bash
-   ./scripts/nemotron.sh start --model ~/.cache/huggingface/.../Q8_0.gguf
+   ./scripts/nemotron.sh start
    ```
 
 5. Verify services are running:
@@ -727,7 +727,7 @@ When completing the migration, update the README.md with the following:
   ```bash
   # Single unified container (replaces both nemotron-asr and llama-q4)
   export HUGGINGFACE_ACCESS_TOKEN=$(cat ~/.cache/huggingface/token)
-  ./scripts/nemotron.sh start --model ~/.cache/huggingface/hub/.../Q8_0.gguf
+  ./scripts/nemotron.sh start
   ```
 
 ### Architecture Diagram

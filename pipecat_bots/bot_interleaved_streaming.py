@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 #
-# Simplified Pipecat bot for testing ASR accuracy.
+# Pipecat bot with interleaved streaming for lowest latency.
 #
-# Same as bot_interleaved_streaming.py but with simple Silero VAD only (no SmartTurn).
-# Uses longer silence threshold (800ms) for more conservative turn detection.
+# Uses chunked LLM (sentence-boundary streaming) with adaptive WebSocket TTS.
+# SmartTurn analyzer for responsive turn-taking.
 #
 # Environment variables:
 #   NVIDIA_ASR_URL        ASR WebSocket URL (default: ws://localhost:8080)
@@ -11,8 +11,9 @@
 #   NVIDIA_TTS_URL        Magpie TTS server URL (default: http://localhost:8001)
 #
 # Usage:
-#   uv run pipecat_bots/bot_simple_vad.py
-#   uv run pipecat_bots/bot_simple_vad.py -t webrtc
+#   uv run pipecat_bots/bot_interleaved_streaming.py
+#   uv run pipecat_bots/bot_interleaved_streaming.py -t daily
+#   uv run pipecat_bots/bot_interleaved_streaming.py -t webrtc
 #
 
 import os
@@ -20,6 +21,8 @@ import os
 from dotenv import load_dotenv
 from loguru import logger
 
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import LLMRunFrame
@@ -47,36 +50,37 @@ NVIDIA_ASR_URL = os.getenv("NVIDIA_ASR_URL", "ws://localhost:8080")
 NVIDIA_LLAMA_CPP_URL = os.getenv("NVIDIA_LLAMA_CPP_URL", "http://localhost:8000")
 NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
 
-# Transport configurations with SIMPLE VAD only (no SmartTurn)
-# Using stop_secs=0.8 (800ms) for conservative turn detection
+# Transport configurations with VAD and SmartTurn analyzer
+# stop_secs=0.34 aligns with ASR model's trailing context requirements:
+# - At 16kHz/20ms chunks, 340ms VAD silence = ~320ms at server (minus triggering chunk)
+# - ASR needs (right_context+1)*160ms = 320ms trailing silence for finalization
 transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
-        # NO turn_analyzer - just simple VAD
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
+        turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
-        # NO turn_analyzer
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
+        turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.8)),
-        # NO turn_analyzer
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
+        turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
 }
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-    logger.info("Starting simple VAD bot (NO SmartTurn)")
+    logger.info("Starting interleaved streaming bot")
     logger.info(f"  ASR URL: {NVIDIA_ASR_URL}")
     logger.info(f"  LLM URL: {NVIDIA_LLAMA_CPP_URL}")
     logger.info(f"  TTS URL: {NVIDIA_TTS_URL}")
-    logger.info(f"  VAD: Silero with stop_secs=0.8 (NO SmartTurn)")
     logger.info(f"  Transport: {type(transport).__name__}")
 
     # NVIDIA Parakeet ASR via WebSocket
@@ -86,6 +90,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     )
 
     # WebSocket Magpie TTS with adaptive mode
+    # Adaptive mode: streaming for first segment (~370ms TTFB), batch for subsequent (quality)
     tts = MagpieWebSocketTTSService(
         server_url=NVIDIA_TTS_URL,
         voice="aria",
@@ -130,6 +135,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     context = LLMContext(messages)
     context_aggregator = LLMContextAggregatorPair(context)
 
+    # RTVI processor for client communication
     rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
 
     pipeline = Pipeline(

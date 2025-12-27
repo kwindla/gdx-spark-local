@@ -48,6 +48,11 @@ ENABLE_TTS="true"
 ENABLE_LLM="true"
 DETACH="true"
 
+# Default model paths (auto-detected from HuggingFace cache)
+DEFAULT_Q8_MODEL="$(find "$HOME/.cache/huggingface/hub/models--unsloth--Nemotron-3-Nano-30B-A3B-GGUF" -name "*Q8*.gguf" 2>/dev/null | head -1)"
+DEFAULT_Q4_MODEL="$(find "$HOME/.cache/huggingface/hub/models--unsloth--Nemotron-3-Nano-30B-A3B-GGUF" -name "*Q4*.gguf" 2>/dev/null | head -1)"
+DEFAULT_VLLM_MODEL="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+
 # =============================================================================
 # Helper functions
 # =============================================================================
@@ -188,14 +193,39 @@ cmd_start() {
         docker rm "$CONTAINER_NAME" > /dev/null
     fi
 
-    # Validate model path for LLM
+    # Validate model path for LLM (use defaults if not specified)
     if [[ "$ENABLE_LLM" == "true" ]]; then
         case "$LLM_MODE" in
-            llamacpp-q8|llamacpp-q4)
+            llamacpp-q8)
                 if [[ -z "$LLAMA_MODEL" ]]; then
-                    echo "ERROR: --model is required for $LLM_MODE mode"
-                    echo "Example: --model ~/.cache/huggingface/hub/models--unsloth--Nemotron-3-Nano-30B-A3B-GGUF/snapshots/.../Q8_0.gguf"
-                    exit 1
+                    if [[ -n "$DEFAULT_Q8_MODEL" ]]; then
+                        LLAMA_MODEL="$DEFAULT_Q8_MODEL"
+                        echo "Using default Q8 model: $LLAMA_MODEL"
+                    else
+                        echo "ERROR: No Q8 model found in HuggingFace cache"
+                        echo "Download with: huggingface-cli download unsloth/Nemotron-3-Nano-30B-A3B-GGUF"
+                        echo "Or specify: --model /path/to/model.gguf"
+                        exit 1
+                    fi
+                fi
+                # Expand ~ and make absolute
+                LLAMA_MODEL="${LLAMA_MODEL/#\~/$HOME}"
+                LLAMA_MODEL="$(cd "$(dirname "$LLAMA_MODEL")" && pwd)/$(basename "$LLAMA_MODEL")"
+                if [[ ! -f "$LLAMA_MODEL" ]]; then
+                    echo "WARNING: Model file not found: $LLAMA_MODEL"
+                fi
+                ;;
+            llamacpp-q4)
+                if [[ -z "$LLAMA_MODEL" ]]; then
+                    if [[ -n "$DEFAULT_Q4_MODEL" ]]; then
+                        LLAMA_MODEL="$DEFAULT_Q4_MODEL"
+                        echo "Using default Q4 model: $LLAMA_MODEL"
+                    else
+                        echo "ERROR: No Q4 model found in HuggingFace cache"
+                        echo "Download with: huggingface-cli download unsloth/Nemotron-3-Nano-30B-A3B-GGUF"
+                        echo "Or specify: --model /path/to/model.gguf"
+                        exit 1
+                    fi
                 fi
                 # Expand ~ and make absolute
                 LLAMA_MODEL="${LLAMA_MODEL/#\~/$HOME}"
@@ -206,9 +236,8 @@ cmd_start() {
                 ;;
             vllm)
                 if [[ -z "$VLLM_MODEL" ]]; then
-                    echo "ERROR: --model is required for vllm mode"
-                    echo "Example: --model nvidia/Llama-3.1-Nemotron-Nano-8B-v1"
-                    exit 1
+                    VLLM_MODEL="$DEFAULT_VLLM_MODEL"
+                    echo "Using default vLLM model: $VLLM_MODEL"
                 fi
                 ;;
             *)

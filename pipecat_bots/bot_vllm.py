@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 #
-# Pipecat bot using local NVIDIA ASR/TTS with vLLM for LLM.
+# Pipecat bot using vLLM for higher quality inference.
 #
-# Based on bot.py but simplified to only use vLLM (OpenAI-compatible API).
+# Uses vLLM (OpenAI-compatible API) instead of llama.cpp. Requires more VRAM (~72GB)
+# but provides higher quality inference with full BF16 weights.
+#
+# Environment variables:
+#   NVIDIA_ASR_URL        ASR WebSocket URL (default: ws://localhost:8080)
+#   NVIDIA_LLM_URL        vLLM API URL (default: http://localhost:8000/v1)
+#   NVIDIA_LLM_MODEL      Model name/path (default: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
+#   NVIDIA_LLM_API_KEY    API key for vLLM (default: not-needed)
+#   NVIDIA_TTS_URL        Magpie TTS server URL (default: http://localhost:8001)
 #
 # Usage:
 #   uv run pipecat_bots/bot_vllm.py
 #   uv run pipecat_bots/bot_vllm.py -t daily
 #   uv run pipecat_bots/bot_vllm.py -t webrtc
-#
-# Environment variables (loaded from .env):
-#   NVIDIA_ASR_URL - ASR WebSocket URL (default: ws://localhost:8080)
-#   NVIDIA_LLM_URL - vLLM API URL (default: http://localhost:8000/v1)
-#   NVIDIA_LLM_MODEL - LLM model name (default: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
-#   NVIDIA_TTS_URL - Magpie TTS server URL (default: http://localhost:8001)
-#   USE_LOCAL_TTS - Use local Magpie TTS instead of Cartesia (default: true)
-#   USE_WEBSOCKET_TTS - Use WebSocket adaptive TTS (default: false)
-#   CARTESIA_API_KEY - Cartesia TTS API key (required if USE_LOCAL_TTS=false)
 #
 
 import os
@@ -28,27 +27,23 @@ from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import Frame, LLMRunFrame
+from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
-from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.openai.llm import OpenAILLMService
-
-
-# Import our custom local services
-from nvidia_stt import NVidiaWebSocketSTTService
-from magpie_http_tts import MagpieHTTPTTSService  # HTTP client for Magpie TTS server (batch)
-from magpie_websocket_tts import MagpieWebSocketTTSService  # WebSocket adaptive TTS
-from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
+
+# Import our custom local services
+from nvidia_stt import NVidiaWebSocketSTTService
+from magpie_websocket_tts import MagpieWebSocketTTSService
 
 load_dotenv(override=True)
 
@@ -59,54 +54,39 @@ NVIDIA_LLM_MODEL = os.getenv(
     "NVIDIA_LLM_MODEL",
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 )
+NVIDIA_LLM_API_KEY = os.getenv("NVIDIA_LLM_API_KEY", "not-needed")
 NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
 
-# TTS configuration
-# Set USE_LOCAL_TTS=false to use Cartesia cloud TTS instead
-USE_LOCAL_TTS = os.getenv("USE_LOCAL_TTS", "true").lower() in ("true", "1", "yes")
-# Set USE_WEBSOCKET_TTS=true for WebSocket-based adaptive streaming
-USE_WEBSOCKET_TTS = os.getenv("USE_WEBSOCKET_TTS", "false").lower() in ("true", "1", "yes")
-
-# Transport configurations with VAD and turn analyzer
+# Transport configurations with VAD and SmartTurn analyzer
+# stop_secs=0.34 aligns with ASR model's trailing context requirements
 transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
 }
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-    # Determine TTS mode
-    if USE_LOCAL_TTS:
-        if USE_WEBSOCKET_TTS:
-            tts_mode = "websocket"
-        else:
-            tts_mode = "batch"
-        tts_type = f"Magpie {tts_mode} ({NVIDIA_TTS_URL})"
-    else:
-        tts_mode = "cloud"
-        tts_type = "Cartesia (cloud)"
-
-    logger.info(f"Starting bot (local ASR, vLLM, {tts_type} TTS)")
+    logger.info("Starting vLLM bot")
     logger.info(f"  ASR URL: {NVIDIA_ASR_URL}")
     logger.info(f"  LLM URL: {NVIDIA_LLM_URL}")
     logger.info(f"  LLM Model: {NVIDIA_LLM_MODEL}")
-    logger.info(f"  TTS: {tts_type}")
+    logger.info(f"  TTS URL: {NVIDIA_TTS_URL}")
     logger.info(f"  Transport: {type(transport).__name__}")
 
     # NVIDIA Parakeet ASR via WebSocket
@@ -115,38 +95,21 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         sample_rate=16000,
     )
 
-    # TTS service selection
-    if USE_LOCAL_TTS:
-        if USE_WEBSOCKET_TTS:
-            # WebSocket Magpie TTS - full-duplex adaptive streaming
-            tts = MagpieWebSocketTTSService(
-                server_url=NVIDIA_TTS_URL,
-                voice="aria",
-                language="en",
-                params=MagpieWebSocketTTSService.InputParams(
-                    language="en",
-                    streaming_preset="conservative",
-                ),
-            )
-            logger.info("Using WebSocket Magpie TTS (full-duplex)")
-        else:
-            # Batch Magpie TTS via HTTP server
-            tts = MagpieHTTPTTSService(
-                server_url=NVIDIA_TTS_URL,
-                voice="aria",
-                language="en",
-            )
-            logger.info("Using batch Magpie TTS")
-    else:
-        # Cartesia TTS (cloud) - fallback option
-        tts = CartesiaTTSService(
-            api_key=os.getenv("CARTESIA_API_KEY"),
-            voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22",  # British Lady
-        )
+    # WebSocket Magpie TTS (batch-only mode - vLLM doesn't do sentence-boundary chunking)
+    tts = MagpieWebSocketTTSService(
+        server_url=NVIDIA_TTS_URL,
+        voice="aria",
+        language="en",
+        params=MagpieWebSocketTTSService.InputParams(
+            language="en",
+            streaming_preset="conservative",
+        ),
+    )
+    logger.info("Using WebSocket Magpie TTS (batch mode)")
 
     # vLLM via OpenAI-compatible API
     llm = OpenAILLMService(
-        api_key=os.getenv("NVIDIA_LLM_API_KEY", "not-needed"),
+        api_key=NVIDIA_LLM_API_KEY,
         base_url=NVIDIA_LLM_URL,
         model=NVIDIA_LLM_MODEL,
         params=OpenAILLMService.InputParams(
@@ -189,7 +152,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     pipeline = Pipeline(
         [
             transport.input(),
-            rtvi,  # RTVI processor (early in chain for client messages)
+            rtvi,
             stt,
             context_aggregator.user(),
             llm,
