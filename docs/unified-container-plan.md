@@ -568,6 +568,24 @@ RUN uv pip install --no-cache --reinstall /tmp/pytorch_wheel/torch*.whl
 
 **Solution**: After vLLM install and PyTorch reinstall, rebuild torchaudio from source.
 
+### 8. vLLM Nemotron-H Activation Compatibility
+
+**Problem**: Newer vLLM commits (after Dec 21, 2025) break support for Nemotron-H's `relu2_no_mul` MoE activation function, causing `ValueError: Unsupported FusedMoe activation: relu2_no_mul`.
+
+**Solution**: Use vLLM commit `bb80f69bc98cbf062bf030cb11185f7ba526e28a` (Dec 21, 2025) which matches the working `vllm:cuda13-full` container.
+
+**Fixes Applied to Dockerfile.unified**:
+
+1. **vLLM commit**: Changed from `5326c89803566a131c928f7fdd2100b75c981a42` (Dec 26) to `bb80f69bc98cbf062bf030cb11185f7ba526e28a` (Dec 21) - matching the working `vllm:cuda13-full` container
+
+2. **Build environment**: Added `TORCH_CUDA_ARCH_LIST="12.1"` and `MAX_JOBS=8`
+
+3. **Build dependencies**: Added `packaging`, `wheel`, `jinja2`
+
+4. **Install mode**: Changed back to editable install (`-e .`)
+
+5. **Cleanup**: Keep `/build/vllm` for editable install
+
 ## Additional Considerations
 
 ### Image Size
