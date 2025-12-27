@@ -37,8 +37,8 @@ class GenerationMode(Enum):
 class TTSStream:
     """State for a single adaptive TTS stream.
 
-    Tracks text buffering, audio generation progress, and determines
-    when to switch between streaming and batch modes.
+    Tracks text queue and audio generation progress.
+    Client controls chunking - each text message is one segment.
     """
 
     stream_id: str
@@ -47,9 +47,8 @@ class TTSStream:
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
 
-    # Text management
+    # Text management - each append goes directly to queue
     pending_text: list[str] = field(default_factory=list)
-    text_buffer: str = ""
 
     # Audio tracking
     generated_audio_ms: float = 0.0
@@ -60,17 +59,7 @@ class TTSStream:
     error_message: str = ""
 
     # Constants
-    MS_PER_WORD: float = 400.0  # ~150 WPM = 2.5 words/sec
-    TARGET_AUDIO_MS: float = 500.0  # Flush almost immediately - client controls chunking
     IDLE_TIMEOUT_S: float = 30.0  # Cleanup after inactivity
-
-    def estimate_audio_ms(self, text: str) -> float:
-        """Estimate audio duration from text using word count.
-
-        At ~150 WPM (natural speech), each word takes ~400ms.
-        """
-        words = len(text.split())
-        return words * self.MS_PER_WORD
 
     @property
     def is_active(self) -> bool:
@@ -87,60 +76,25 @@ class TTSStream:
         self.last_activity = time.time()
 
     def append_text(self, text: str):
-        """Append text to the stream buffer."""
-        self.touch()
-        self.text_buffer += text
-        logger.debug(f"[{self.stream_id[:8]}] Text appended, buffer: '{self.text_buffer[:50]}...'")
+        """Append text segment to the pending queue.
 
-    def flush_text_buffer(self) -> Optional[str]:
-        """Flush text buffer to pending queue if ready.
-
-        Flushes when:
-        1. Estimated audio >= TARGET_AUDIO_MS (~4 words)
-        2. Stream is closed (flush remaining)
-
-        Returns flushed text or None if not ready to flush.
+        Each text message is treated as one segment - no buffering.
         """
-        if not self.text_buffer:
-            return None
-
-        estimated_audio = self.estimate_audio_ms(self.text_buffer)
-        should_flush = (
-            estimated_audio >= self.TARGET_AUDIO_MS
-            or self.state == StreamState.CLOSED
-        )
-
-        if should_flush:
-            text = self.text_buffer.strip()
-            self.text_buffer = ""
-            if text:
-                self.pending_text.append(text)
-                words = len(text.split())
-                logger.info(
-                    f"[{self.stream_id[:8]}] Flushed: '{text[:50]}...' "
-                    f"(words={words}, est_audio={estimated_audio:.0f}ms)"
-                )
-                return text
-
-        return None
+        self.touch()
+        text = text.strip()
+        if text:
+            self.pending_text.append(text)
+            logger.debug(f"[{self.stream_id[:8]}] Text queued: '{text[:50]}...'")
 
     def get_next_segment(self) -> Optional[str]:
-        """Get next text segment to generate.
-
-        First tries to flush text buffer, then returns from pending queue.
-        """
-        # Try to flush buffer first
-        self.flush_text_buffer()
-
-        # Return from pending queue
+        """Get next text segment to generate."""
         if self.pending_text:
             return self.pending_text.pop(0)
-
         return None
 
     def has_pending_text(self) -> bool:
         """Check if there's text waiting to be generated."""
-        return bool(self.pending_text) or bool(self.text_buffer.strip())
+        return bool(self.pending_text)
 
     def record_audio_generated(self, audio_bytes: int, sample_rate: int = 22000):
         """Record that audio was generated.
@@ -161,7 +115,8 @@ class TTSStream:
         """Signal that no more text will be appended."""
         self.touch()
         self.state = StreamState.CLOSED
-        logger.info(f"[{self.stream_id[:8]}] Stream closed, buffer='{self.text_buffer[:30]}...'")
+        pending = len(self.pending_text)
+        logger.info(f"[{self.stream_id[:8]}] Stream closed, pending_segments={pending}")
 
     def cancel(self):
         """Cancel the stream."""
@@ -223,8 +178,6 @@ class StreamManager:
 
         async with self._lock:
             self._streams[stream_id] = stream
-
-        # NOTE: No background flush task - send_audio polls flush_text_buffer() directly
 
         logger.info(f"[{stream_id[:8]}] Stream created (voice={voice}, language={language})")
         return stream

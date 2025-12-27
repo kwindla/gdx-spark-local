@@ -16,9 +16,7 @@
 #   NVIDIA_LLM_MODEL - LLM model name (default: /workspace/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
 #   NVIDIA_TTS_URL - Magpie TTS server URL (default: http://localhost:8001)
 #   USE_LOCAL_TTS - Use local Magpie TTS instead of Cartesia (default: true)
-#   USE_STREAMING_TTS - Use streaming TTS for lower TTFB ~150ms vs ~550ms (default: true)
-#   USE_ADAPTIVE_TTS - Use adaptive streaming TTS for best quality with fast TTFB (default: false)
-#   USE_WEBSOCKET_TTS - Use WebSocket adaptive TTS (solves HTTP blocking issues) (default: false)
+#   USE_WEBSOCKET_TTS - Use WebSocket adaptive TTS (default: false)
 #   USE_CHUNKED_LLM - Use chunked LLM for sentence-boundary streaming (default: false)
 #   CARTESIA_API_KEY - Cartesia TTS API key (required if USE_LOCAL_TTS=false)
 #
@@ -48,8 +46,6 @@ from pipecat.services.openai.llm import OpenAILLMService
 # Import our custom local services
 from nvidia_stt import NVidiaWebSocketSTTService
 from magpie_http_tts import MagpieHTTPTTSService  # HTTP client for Magpie TTS server (batch)
-from magpie_streaming_tts import MagpieStreamingTTSService  # HTTP client for streaming TTS
-from magpie_adaptive_tts import MagpieAdaptiveTTSService  # Adaptive streaming TTS (HTTP)
 from magpie_websocket_tts import MagpieWebSocketTTSService  # WebSocket adaptive TTS
 from llama_cpp_chunked_llm import LlamaCppChunkedLLMService  # Direct llama.cpp chunked LLM
 from pipecat.services.cartesia.tts import CartesiaTTSService
@@ -73,11 +69,7 @@ NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
 # TTS configuration
 # Set USE_LOCAL_TTS=false to use Cartesia cloud TTS instead
 USE_LOCAL_TTS = os.getenv("USE_LOCAL_TTS", "true").lower() in ("true", "1", "yes")
-# Set USE_STREAMING_TTS=true for lower TTFB (~150ms vs ~550ms batch)
-USE_STREAMING_TTS = os.getenv("USE_STREAMING_TTS", "true").lower() in ("true", "1", "yes")
-# Set USE_ADAPTIVE_TTS=true for adaptive streaming (streaming for TTFB, batch for quality)
-USE_ADAPTIVE_TTS = os.getenv("USE_ADAPTIVE_TTS", "false").lower() in ("true", "1", "yes")
-# Set USE_WEBSOCKET_TTS=true for WebSocket-based adaptive streaming (solves HTTP blocking)
+# Set USE_WEBSOCKET_TTS=true for WebSocket-based adaptive streaming
 USE_WEBSOCKET_TTS = os.getenv("USE_WEBSOCKET_TTS", "false").lower() in ("true", "1", "yes")
 # Set USE_CHUNKED_LLM=true for sentence-boundary chunking (best with USE_WEBSOCKET_TTS)
 USE_CHUNKED_LLM = os.getenv("USE_CHUNKED_LLM", "false").lower() in ("true", "1", "yes")
@@ -110,10 +102,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     if USE_LOCAL_TTS:
         if USE_WEBSOCKET_TTS:
             tts_mode = "websocket"
-        elif USE_ADAPTIVE_TTS:
-            tts_mode = "adaptive-http"
-        elif USE_STREAMING_TTS:
-            tts_mode = "streaming"
         else:
             tts_mode = "batch"
         tts_type = f"Magpie {tts_mode} ({NVIDIA_TTS_URL})"
@@ -147,7 +135,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # TTS service selection
     if USE_LOCAL_TTS:
         if USE_WEBSOCKET_TTS:
-            # WebSocket Magpie TTS - full-duplex, solves HTTP blocking issues
+            # WebSocket Magpie TTS - full-duplex adaptive streaming
             # Enable adaptive mode when using chunked LLM for optimal latency
             tts = MagpieWebSocketTTSService(
                 server_url=NVIDIA_TTS_URL,
@@ -161,22 +149,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             )
             mode_desc = "adaptive" if USE_CHUNKED_LLM else "batch-only"
             logger.info(f"Using WebSocket Magpie TTS (full-duplex, {mode_desc})")
-        elif USE_ADAPTIVE_TTS:
-            # HTTP Adaptive Magpie TTS - streaming TTFB, batch quality when buffer healthy
-            tts = MagpieAdaptiveTTSService(
-                server_url=NVIDIA_TTS_URL,
-                voice="aria",
-                language="en",
-            )
-            logger.info("Using HTTP adaptive Magpie TTS (streaming TTFB, batch quality)")
-        elif USE_STREAMING_TTS:
-            # Streaming Magpie TTS - lower TTFB (~150ms vs ~550ms)
-            tts = MagpieStreamingTTSService(
-                server_url=NVIDIA_TTS_URL,
-                voice="aria",
-                language="en",
-            )
-            logger.info("Using streaming Magpie TTS (low TTFB)")
         else:
             # Batch Magpie TTS via HTTP server
             tts = MagpieHTTPTTSService(
