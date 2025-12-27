@@ -15,8 +15,9 @@ This document describes the plan to combine the three services (ASR, TTS, LLM) c
 | 7. Test ASR service | DONE | WebSocket working |
 | 8. Test TTS service | DONE | WebSocket streaming working |
 | 9. Test LLM service (llama.cpp) | DONE | HTTP completion working |
-| 10. Test full pipeline | DONE | LLM→TTS integration verified |
-| 11. Migration from two containers | PENDING | |
+| 10. Test LLM service (vLLM) | DONE | All 3 services running together |
+| 11. Test full pipeline | DONE | LLM→TTS integration verified |
+| 12. Migration from two containers | PENDING | |
 
 ### Important Notes
 
@@ -388,7 +389,7 @@ Expected: LLM generates text, TTS converts to audio.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HUGGINGFACE_ACCESS_TOKEN` | - | HuggingFace token for gated models |
-| `SERVICE_TIMEOUT` | `60` | Seconds to wait for each service health check |
+| `SERVICE_TIMEOUT` | `60` (llama.cpp) / `900` (vLLM) | Seconds to wait for each service health check |
 
 ## Model Storage Strategy
 
@@ -586,6 +587,24 @@ RUN uv pip install --no-cache --reinstall /tmp/pytorch_wheel/torch*.whl
 
 5. **Cleanup**: Keep `/build/vllm` for editable install
 
+### 9. vLLM DNS Resolution with Docker Bridge Networking
+
+**Problem**: vLLM mode fails with DNS resolution errors when trying to access HuggingFace to verify model files. Docker's default bridge networking uses a Tailscale DNS server that can't resolve external hostnames.
+
+**Solution**: Use `--network=host` for vLLM mode. The `nemotron.sh` script automatically uses host networking when `--mode vllm` is specified.
+
+### 10. Workspace vllm Directory Shadowing
+
+**Problem**: If there's a `vllm/` directory in the project root, mounting `/workspace` causes Python to import from that directory instead of the installed vLLM package, resulting in `ImportError: cannot import name 'SamplingParams' from 'vllm'`.
+
+**Solution**: Rename any local `vllm/` directory to something else (e.g., `vllm_plugins/`). The directory was renamed in the project.
+
+### 11. vLLM Long Startup Time
+
+**Problem**: vLLM takes ~10-15 minutes to load the 58GB Nemotron-3-Nano-30B-A3B-BF16 model. The default 60-second `SERVICE_TIMEOUT` causes startup to fail.
+
+**Solution**: The `start_unified.sh` script automatically sets `SERVICE_TIMEOUT=900` (15 minutes) when `LLM_MODE=vllm`.
+
 ## Additional Considerations
 
 ### Image Size
@@ -632,14 +651,16 @@ The following improvements are deferred but should be considered for production:
 
 ### High Priority
 
-1. **vLLM Local Path Handling**: The `nemotron.sh` script doesn't properly mount local model directories for vLLM mode. Currently only HuggingFace model IDs work reliably.
+1. **ASR HTTP Health Check**: The ASR server is WebSocket-only, so the `nemotron.sh status` command shows "DOWN" even when ASR is running. Add an HTTP `/health` endpoint to the ASR server for consistent status checking across all services.
 
-2. **Log Persistence**: Logs at `/var/log/nemotron/` are lost when the container restarts. Consider mounting a host volume:
+2. **vLLM Local Path Handling**: The `nemotron.sh` script doesn't properly mount local model directories for vLLM mode. Currently only HuggingFace model IDs work reliably.
+
+3. **Log Persistence**: Logs at `/var/log/nemotron/` are lost when the container restarts. Consider mounting a host volume:
    ```bash
    -v "$PROJECT_DIR/logs:/var/log/nemotron"
    ```
 
-3. **ARM64 Architecture Check**: Add explicit check in Dockerfile since it only works on ARM64 (DGX Spark):
+4. **ARM64 Architecture Check**: Add explicit check in Dockerfile since it only works on ARM64 (DGX Spark):
    ```dockerfile
    RUN if [ "$(uname -m)" != "aarch64" ]; then \
          echo "ERROR: This Dockerfile is for ARM64 only" && exit 1; \
@@ -648,24 +669,24 @@ The following improvements are deferred but should be considered for production:
 
 ### Medium Priority
 
-4. **Port Customization**: Allow configuring service ports via `nemotron.sh`:
+5. **Port Customization**: Allow configuring service ports via `nemotron.sh`:
    ```bash
    ./scripts/nemotron.sh start --port-llm 9000 --port-tts 9001 --port-asr 9080
    ```
 
-5. **Pip Dependency Pinning**: Generate a lockfile or pin exact versions for reproducibility. Currently pip packages may drift over time.
+6. **Pip Dependency Pinning**: Generate a lockfile or pin exact versions for reproducibility. Currently pip packages may drift over time.
 
-6. **Service Auto-Restart**: Consider supervisord for per-service restart on crash (current behavior: any service exit stops the container).
+7. **Service Auto-Restart**: Consider supervisord for per-service restart on crash (current behavior: any service exit stops the container).
 
 ### Low Priority
 
-7. **Prometheus Metrics**: Add `/metrics` endpoints for monitoring (request latency, GPU memory, queue depth).
+8. **Prometheus Metrics**: Add `/metrics` endpoints for monitoring (request latency, GPU memory, queue depth).
 
-8. **Config File Support**: Replace environment variable sprawl with a YAML/TOML config file for complex deployments.
+9. **Config File Support**: Replace environment variable sprawl with a YAML/TOML config file for complex deployments.
 
-9. **Resource Limits**: Add CPU/memory limits to prevent container from starving other processes.
+10. **Resource Limits**: Add CPU/memory limits to prevent container from starving other processes.
 
-10. **Non-Root User**: Create a dedicated user for running services instead of root.
+11. **Non-Root User**: Create a dedicated user for running services instead of root.
 
 ## Alternative: Supervisor/systemd
 
