@@ -1,11 +1,11 @@
 # Dockerfile.unified - Unified ASR + TTS + LLM container
 #
 # Supported Platforms:
-#   - NVIDIA DGX Spark (ARM64 + Blackwell GB10, sm_121)
-#   - x86_64 + Blackwell GPUs (RTX 5090, sm_120)
+#   - NVIDIA DGX Spark (ARM64 + Blackwell GB10, sm_121) - CUDA 13.1
+#   - x86_64 + Blackwell GPUs (RTX 5090, sm_120) - CUDA 13.0
 #
 # Purpose: Single container with all services sharing one CUDA context
-# Base: CUDA 13.1.0 devel
+# Base: Auto-selected based on target architecture (arm64 → 13.1, amd64 → 13.0)
 # PyTorch: Built from source with auto-detected TORCH_CUDA_ARCH_LIST
 # Services:
 #   - ASR: Parakeet streaming ASR (NeMo) - port 8080
@@ -35,11 +35,21 @@
 #     nemotron-unified:cuda13 \
 #     bash /workspace/scripts/start_unified.sh
 
-FROM nvidia/cuda:13.0.0-devel-ubuntu24.04
+# =============================================================================
+# Base Image Selection (auto-detected by Docker BuildKit)
+# =============================================================================
+# TARGETARCH is automatically set by Docker BuildKit to arm64 or amd64.
+# We use different CUDA versions because:
+#   - DGX Spark (arm64): Driver supports CUDA 13.1
+#   - RTX 5090 (amd64): Driver supports CUDA 13.0
+ARG TARGETARCH
+FROM nvidia/cuda:13.1.0-devel-ubuntu24.04 AS base-arm64
+FROM nvidia/cuda:13.0.0-devel-ubuntu24.04 AS base-amd64
+FROM base-${TARGETARCH}
 
 LABEL maintainer="nemotron-speech"
-LABEL description="Unified ASR + TTS + LLM container for CUDA 13.0 (ARM64 sm_121 / x86_64 sm_120)"
-LABEL version="1.1"
+LABEL description="Unified ASR + TTS + LLM container (ARM64 sm_121 CUDA 13.1 / x86_64 sm_120 CUDA 13.0)"
+LABEL version="1.2"
 
 # Prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
