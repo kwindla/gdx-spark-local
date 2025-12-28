@@ -129,7 +129,8 @@ class LlamaCppChunkedLLMService(AIService):
         first_chunk_min_tokens: int = 10
         first_chunk_max_tokens: int = 24
         # LLM generation parameters
-        temperature: float = 0.7
+        # temperature=0.0 for deterministic output - prevents punctuation inconsistency
+        temperature: float = 0.0
         top_p: float = 0.95
         top_k: int = 40
         repeat_penalty: float = 1.1
