@@ -301,6 +301,9 @@ cmd_start() {
         DOCKER_ARGS+=(-e "HF_TOKEN=$HUGGINGFACE_ACCESS_TOKEN")
     fi
 
+    # PyTorch memory allocator config (avoids fragmentation on 32GB GPUs)
+    DOCKER_ARGS+=(-e "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+
     # Add model path based on mode
     if [[ "$ENABLE_LLM" == "true" ]]; then
         case "$LLM_MODE" in
