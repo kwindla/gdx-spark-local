@@ -1,8 +1,12 @@
-# Dockerfile.unified - Unified ASR + TTS + LLM container for DGX Spark (Blackwell GB10)
+# Dockerfile.unified - Unified ASR + TTS + LLM container
+#
+# Supported Platforms:
+#   - NVIDIA DGX Spark (ARM64 + Blackwell GB10, sm_121) - CUDA 13.1
+#   - x86_64 + Blackwell GPUs (RTX 5090, sm_120) - CUDA 13.0
 #
 # Purpose: Single container with all services sharing one CUDA context
-# Base: CUDA 13.1.0 devel
-# PyTorch: Built from source with TORCH_CUDA_ARCH_LIST=12.1
+# Base: Auto-selected based on target architecture (arm64 → 13.1, amd64 → 13.0)
+# PyTorch: Built from source with auto-detected TORCH_CUDA_ARCH_LIST
 # Services:
 #   - ASR: Parakeet streaming ASR (NeMo) - port 8080
 #   - TTS: Magpie TTS multilingual (NeMo) - port 8001
@@ -16,7 +20,7 @@
 #     -v $(pwd):/workspace \
 #     -v ~/.cache/huggingface:/hf_cache:ro \
 #     -p 8000:8000 -p 8001:8001 -p 8080:8080 \
-#     -e LLAMA_MODEL=/hf_cache/hub/models--unsloth--Nemotron-3-Nano-30B-A3B-GGUF/snapshots/.../Q8_0.gguf \
+#     -e LLAMA_MODEL=/hf_cache/hub/models--unsloth--Nemotron-3-Nano-30B-A3B-GGUF/snapshots/.../Q4_K_M.gguf \
 #     -e HUGGINGFACE_ACCESS_TOKEN=$HUGGINGFACE_ACCESS_TOKEN \
 #     nemotron-unified:cuda13 \
 #     bash /workspace/scripts/start_unified.sh
@@ -31,11 +35,21 @@
 #     nemotron-unified:cuda13 \
 #     bash /workspace/scripts/start_unified.sh
 
-FROM nvidia/cuda:13.1.0-devel-ubuntu24.04
+# =============================================================================
+# Base Image Selection (auto-detected by Docker BuildKit)
+# =============================================================================
+# TARGETARCH is automatically set by Docker BuildKit to arm64 or amd64.
+# We use different CUDA versions because:
+#   - DGX Spark (arm64): Driver supports CUDA 13.1
+#   - RTX 5090 (amd64): Driver supports CUDA 13.0
+ARG TARGETARCH
+FROM nvidia/cuda:13.1.0-devel-ubuntu24.04 AS base-arm64
+FROM nvidia/cuda:13.0.0-devel-ubuntu24.04 AS base-amd64
+FROM base-${TARGETARCH}
 
 LABEL maintainer="nemotron-speech"
-LABEL description="Unified ASR + TTS + LLM container for CUDA 13.1 sm_121 (DGX Spark)"
-LABEL version="1.0"
+LABEL description="Unified ASR + TTS + LLM container (ARM64 sm_121 CUDA 13.1 / x86_64 sm_120 CUDA 13.0)"
+LABEL version="1.2"
 
 # Prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -73,23 +87,42 @@ ENV UV_SYSTEM_PYTHON=1
 ENV UV_BREAK_SYSTEM_PACKAGES=1
 
 # =============================================================================
-# Phase 2: CUDA Libraries (cuDNN + NCCL from NGC PyTorch container)
+# Phase 2: CUDA Libraries (cuDNN + NCCL)
 # =============================================================================
-# cuDNN (required for PyTorch CUDA)
-COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/lib/aarch64-linux-gnu/libcudnn* /usr/lib/aarch64-linux-gnu/
+# Copy BOTH cuDNN AND NCCL from NGC PyTorch container to ensure version compatibility
+# The NGC container has NCCL 2.28+ with ncclDevCommDestroy symbol required by PyTorch
+# The apt NCCL in CUDA 13.0 container is too old (missing ncclDevCommDestroy)
+
+# cuDNN (required for PyTorch CUDA) - copy from NGC container
+COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/lib/*/libcudnn* /tmp/cudnn_libs/
 COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/include/cudnn* /usr/include/
 
-# NCCL (required for PyTorch distributed/NeMo)
-COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/lib/aarch64-linux-gnu/libnccl* /usr/lib/aarch64-linux-gnu/
+# NCCL (required for PyTorch distributed/NeMo) - copy from NGC container for ncclDevCommDestroy
+COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/lib/*/libnccl* /tmp/nccl_libs/
 COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/include/nccl.h /usr/include/
 COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/include/nccl_device.h /usr/include/
 COPY --from=nvcr.io/nvidia/pytorch:25.11-py3 /usr/include/nccl_device/ /usr/include/nccl_device/
 
-# Verify and update library cache
-RUN echo "=== Verifying CUDA libraries ===" && \
-    ls -la /usr/lib/aarch64-linux-gnu/libcudnn* | head -3 && \
-    ls -la /usr/lib/aarch64-linux-gnu/libnccl* | head -3 && \
-    ls -la /usr/include/nccl.h && \
+# Move libraries to architecture-specific location and verify
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then \
+        LIB_DIR="/usr/lib/aarch64-linux-gnu"; \
+    else \
+        LIB_DIR="/usr/lib/x86_64-linux-gnu"; \
+    fi && \
+    echo "=== Detected architecture: $ARCH, using $LIB_DIR ===" && \
+    mkdir -p "$LIB_DIR" && \
+    mv /tmp/cudnn_libs/* "$LIB_DIR/" && \
+    mv /tmp/nccl_libs/* "$LIB_DIR/" && \
+    rmdir /tmp/cudnn_libs /tmp/nccl_libs && \
+    echo "=== cuDNN libraries ===" && \
+    ls -la "$LIB_DIR"/libcudnn* | head -3 && \
+    echo "=== NCCL libraries ===" && \
+    ls -la "$LIB_DIR"/libnccl* | head -3 && \
+    echo "=== NCCL device headers ===" && \
+    ls -la /usr/include/nccl_device/ | head -3 && \
+    echo "=== Checking ncclDevCommDestroy symbol ===" && \
+    nm -D "$LIB_DIR"/libnccl.so* 2>/dev/null | grep ncclDevCommDestroy | head -1 || echo "Note: nm check may fail on stripped library" && \
     ldconfig
 
 # =============================================================================
@@ -117,10 +150,10 @@ RUN uv pip install --no-cache \
     pytest
 
 # =============================================================================
-# Phase 4: Build PyTorch from Source (for CUDA 13.1 sm_121 support)
+# Phase 4: Build PyTorch from Source (for CUDA 13.1 support)
 # =============================================================================
 # PyTorch - main branch, 2025-12-26
-# Includes CUDA 13.1 support required for sm_121 (Blackwell/GB10)
+# Includes CUDA 13.1 support required for Blackwell GPUs
 ARG PYTORCH_COMMIT=32cb1dac896fe212d77073a4a53fee840c13442f
 
 WORKDIR /build
@@ -134,8 +167,8 @@ WORKDIR /build/pytorch
 # Update submodules to match the pinned commit
 RUN git submodule sync && git submodule update --init --recursive
 
-# Set build environment for sm_121 (GB10/Blackwell)
-ENV TORCH_CUDA_ARCH_LIST="12.1"
+# Set build environment - architecture auto-detected
+# ARM64 (DGX Spark GB10) = sm_121, x86_64 (RTX 5090) = sm_120
 ENV USE_CUDA=1
 ENV USE_CUDNN=1
 ENV USE_MKLDNN=1
@@ -144,12 +177,10 @@ ENV USE_NCCL=1
 ENV USE_TENSORPIPE=0
 ENV USE_SYSTEM_NCCL=1
 ENV NCCL_ROOT=/usr
-ENV NCCL_LIB_DIR=/usr/lib/aarch64-linux-gnu
 ENV NCCL_INCLUDE_DIR=/usr/include
 ENV BUILD_TEST=0
 ENV MAX_JOBS=8
 ENV CMAKE_BUILD_TYPE=Release
-ENV CUDNN_LIB_DIR=/usr/lib/aarch64-linux-gnu
 ENV CUDNN_INCLUDE_DIR=/usr/include
 ENV USE_PRIORITIZED_TEXT_FOR_LD=1
 
@@ -160,9 +191,20 @@ RUN ln -sf /usr/local/cuda/include/cccl/cub /usr/local/cuda/include/cub && \
     ls /usr/local/cuda/include/cub/cub.cuh && \
     ls /usr/local/cuda/include/cccl/cub/cub.cuh
 
-# Build and install PyTorch, save wheel for potential reinstallation
+# Build and install PyTorch with auto-detected architecture
 ENV CUB_INCLUDE_DIR=/usr/local/cuda/include/cccl
-RUN python3 setup.py bdist_wheel && \
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then \
+        export TORCH_CUDA_ARCH_LIST="12.1"; \
+        export NCCL_LIB_DIR="/usr/lib/aarch64-linux-gnu"; \
+        export CUDNN_LIB_DIR="/usr/lib/aarch64-linux-gnu"; \
+    else \
+        export TORCH_CUDA_ARCH_LIST="12.0"; \
+        export NCCL_LIB_DIR="/usr/lib/x86_64-linux-gnu"; \
+        export CUDNN_LIB_DIR="/usr/lib/x86_64-linux-gnu"; \
+    fi && \
+    echo "=== Building PyTorch for $ARCH with CUDA arch $TORCH_CUDA_ARCH_LIST ===" && \
+    python3 setup.py bdist_wheel && \
     uv pip install --no-cache dist/*.whl && \
     mkdir -p /tmp/pytorch_wheel && \
     cp dist/*.whl /tmp/pytorch_wheel/
@@ -184,7 +226,15 @@ WORKDIR /build/audio
 ENV BUILD_SOX=0
 ENV USE_CUDA=1
 
-RUN python3 setup.py bdist_wheel && \
+# Build torchaudio with auto-detected CUDA architecture
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then \
+        export TORCH_CUDA_ARCH_LIST="12.1"; \
+    else \
+        export TORCH_CUDA_ARCH_LIST="12.0"; \
+    fi && \
+    echo "=== Building torchaudio for $ARCH with CUDA arch $TORCH_CUDA_ARCH_LIST ===" && \
+    python3 setup.py bdist_wheel && \
     uv pip install --no-cache dist/*.whl && \
     mkdir -p /tmp/torchaudio_wheel && \
     cp dist/*.whl /tmp/torchaudio_wheel/
@@ -232,7 +282,7 @@ RUN uv pip install --no-cache \
 # Install NeMo from source with ASR and TTS support
 RUN cd /opt/nemo && uv pip install --no-cache -e ".[asr,tts]"
 
-# Patch NeMo NVRTC for dynamic GPU architecture detection (required for sm_121)
+# Patch NeMo NVRTC for dynamic GPU architecture detection (required for sm_120/sm_121)
 COPY <<'EOF' /tmp/patch_nvrtc.py
 import re
 
@@ -241,7 +291,7 @@ with open('/opt/nemo/nemo/core/utils/cuda_python_utils.py', 'r') as f:
 
 # Find and replace the opts = [] pattern
 old_pattern = r'(\s+)opts = \[\]\n(\s+)\(err,\) = nvrtc\.nvrtcCompileProgram'
-new_code = r'''\1# Detect GPU architecture for sm_121 (GB10) support
+new_code = r'''\1# Detect GPU architecture for sm_120/sm_121 (Blackwell) support
 \1import torch
 \1if torch.cuda.is_available():
 \1    major, minor = torch.cuda.get_device_capability(0)
@@ -296,8 +346,7 @@ RUN git clone https://github.com/vllm-project/vllm.git && \
 
 WORKDIR /build/vllm
 
-# Set vLLM build environment for sm_121 (matching Dockerfile.vllm-cuda13-build)
-ENV TORCH_CUDA_ARCH_LIST="12.1"
+# Set vLLM build environment
 ENV VLLM_TARGET_DEVICE="cuda"
 ENV MAX_JOBS=8
 
@@ -311,24 +360,42 @@ RUN uv pip install --no-cache \
     wheel \
     jinja2
 
-# Build and install vLLM in editable mode (matching Dockerfile.vllm-cuda13-build)
-RUN uv pip install --no-cache -e . --no-build-isolation
+# Build and install vLLM with auto-detected architecture
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then \
+        export TORCH_CUDA_ARCH_LIST="12.1"; \
+    else \
+        export TORCH_CUDA_ARCH_LIST="12.0"; \
+    fi && \
+    echo "=== Building vLLM for $ARCH with CUDA arch $TORCH_CUDA_ARCH_LIST ===" && \
+    uv pip install --no-cache -e . --no-build-isolation
 
 # Reinstall our custom PyTorch (vLLM may have replaced it)
 # Also remove torchvision/torchaudio which vLLM may have installed
-RUN uv pip uninstall torchvision torchaudio || true && \
-    uv pip install --no-cache --reinstall /tmp/pytorch_wheel/torch*.whl
+# CRITICAL: Remove pip nvidia packages - they conflict with NGC libraries we copied:
+#   - nvidia-nccl-cu12: conflicts with system NCCL 2.28.9+ (has ncclDevCommDestroy)
+#   - nvidia-cudnn-cu12: conflicts with NGC cuDNN 9.15.0 (vLLM installs 9.10.2)
+RUN uv pip uninstall torchvision torchaudio nvidia-nccl-cu12 nvidia-cudnn-cu12 || true && \
+    uv pip install --no-cache --reinstall /tmp/pytorch_wheel/torch*.whl && \
+    ldconfig
 
 # Rebuild torchaudio (must match our custom PyTorch)
 # Uses same TORCHAUDIO_COMMIT as Phase 5
 WORKDIR /build
-RUN git clone --recursive https://github.com/pytorch/audio.git torchaudio-rebuild && \
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then \
+        export TORCH_CUDA_ARCH_LIST="12.1"; \
+    else \
+        export TORCH_CUDA_ARCH_LIST="12.0"; \
+    fi && \
+    echo "=== Rebuilding torchaudio for $ARCH with CUDA arch $TORCH_CUDA_ARCH_LIST ===" && \
+    git clone --recursive https://github.com/pytorch/audio.git torchaudio-rebuild && \
     cd torchaudio-rebuild && git checkout ${TORCHAUDIO_COMMIT} && \
     BUILD_SOX=0 USE_CUDA=1 python3 setup.py bdist_wheel && \
     uv pip install --no-cache dist/*.whl && \
     cd .. && rm -rf torchaudio-rebuild
 
-# Install triton and fix ptxas for sm_121a support
+# Install triton and fix ptxas for sm_120a/sm_121a support
 RUN uv pip install --no-cache triton && \
     rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
     ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas
@@ -338,17 +405,24 @@ RUN uv pip install --no-cache triton && \
 # =============================================================================
 # llama.cpp - using the same approach as Dockerfile.vllm-llamacpp
 # Uses cmake flags from the working container build.
-# Note: sm_121a (with 'a' suffix) enables architecture-accelerated features.
+# Note: sm_NNa (with 'a' suffix) enables architecture-accelerated features.
 #
 # Pinned to commit c18428423018ed214c004e6ecaedb0cbdda06805 (Dec 24, 2025)
 # which is the version in the working vllm-llamacpp:cuda13 container.
 ARG LLAMACPP_COMMIT=c18428423018ed214c004e6ecaedb0cbdda06805
-RUN git clone https://github.com/ggerganov/llama.cpp.git /opt/llama.cpp && \
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then \
+        CUDA_ARCH="121a"; \
+    else \
+        CUDA_ARCH="120a"; \
+    fi && \
+    echo "=== Building llama.cpp for $ARCH with CUDA arch $CUDA_ARCH ===" && \
+    git clone https://github.com/ggerganov/llama.cpp.git /opt/llama.cpp && \
     cd /opt/llama.cpp && git checkout ${LLAMACPP_COMMIT} && \
     cmake -B build \
         -DGGML_CUDA=ON \
         -DGGML_CUDA_F16=ON \
-        -DCMAKE_CUDA_ARCHITECTURES="121a" \
+        -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" \
         -DCMAKE_BUILD_TYPE=Release && \
     cmake --build build --config Release -j$(nproc) && \
     # Install binaries to /usr/local
