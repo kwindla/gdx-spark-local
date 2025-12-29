@@ -2,7 +2,9 @@
 
 import asyncio
 import argparse
+import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -10,6 +12,16 @@ import numpy as np
 import torch
 import websockets
 from loguru import logger
+
+# Enable debug logging with DEBUG_ASR=1
+DEBUG_ASR = os.environ.get("DEBUG_ASR", "0") == "1"
+
+
+def _hash_audio(audio: np.ndarray) -> str:
+    """Get short hash of audio array for debugging."""
+    if audio is None or len(audio) == 0:
+        return "empty"
+    return hashlib.md5(audio.tobytes()).hexdigest()[:8]
 
 # Model path
 DEFAULT_MODEL_PATH = "/workspace/models/Parakeet_Reatime_En_600M.nemo"
@@ -147,18 +159,46 @@ class ASRServer:
         self._warmup()
 
     def _warmup(self):
-        """Run warmup inference to claim GPU memory before LLM starts."""
+        """Run warmup inference using streaming API to claim GPU memory.
+
+        IMPORTANT: We use the streaming API (conformer_stream_step) for warmup,
+        NOT the batch API (model.transcribe). The batch API corrupts internal
+        model state and causes subsequent streaming inference to become
+        non-deterministic. See docs/asr-determinism-investigation.md.
+        """
         import time
 
-        logger.info("Running warmup inference to claim GPU memory...")
+        logger.info("Running warmup inference (streaming API) to claim GPU memory...")
         start = time.perf_counter()
 
-        # Generate 1 second of silence for warmup
-        warmup_audio = np.zeros(self.sample_rate, dtype=np.float32)
+        # Generate 1 second of silence plus padding for warmup
+        warmup_samples = self.sample_rate + (self.final_padding_frames * self.hop_samples)
+        warmup_audio = np.zeros(warmup_samples, dtype=np.float32)
 
-        # Run transcription to force all CUDA kernels to compile
-        with torch.no_grad():
-            _ = self.model.transcribe([warmup_audio], batch_size=1)
+        # Run streaming inference to force all CUDA kernels to compile
+        with torch.inference_mode():
+            audio_tensor = torch.from_numpy(warmup_audio).unsqueeze(0).cuda()
+            audio_len = torch.tensor([len(warmup_audio)], device='cuda')
+
+            # Preprocess
+            mel, mel_len = self.model.preprocessor(input_signal=audio_tensor, length=audio_len)
+
+            # Get initial cache
+            cache = self.model.encoder.get_initial_cache_state(batch_size=1)
+
+            # Run streaming step (processes entire mel as one chunk)
+            _ = self.model.conformer_stream_step(
+                processed_signal=mel,
+                processed_signal_length=mel_len,
+                cache_last_channel=cache[0],
+                cache_last_time=cache[1],
+                cache_last_channel_len=cache[2],
+                keep_all_outputs=True,
+                previous_hypotheses=None,
+                previous_pred_out=None,
+                drop_extra_pre_encoded=0,
+                return_transcription=True,
+            )
 
         elapsed = (time.perf_counter() - start) * 1000
         logger.info(f"Warmup complete in {elapsed:.0f}ms - GPU memory claimed")
@@ -234,6 +274,11 @@ class ASRServer:
     async def _handle_audio(self, session: ASRSession, audio_bytes: bytes):
         """Accumulate audio and process when enough frames available."""
         audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+        if DEBUG_ASR:
+            chunk_hash = hashlib.md5(audio_bytes).hexdigest()[:8]
+            logger.debug(f"Session {session.id}: recv chunk {len(audio_bytes)}B hash={chunk_hash}")
+
         session.accumulated_audio = np.concatenate([session.accumulated_audio, audio_np])
 
         # Process if we have enough audio for new frames
@@ -265,11 +310,19 @@ class ASRServer:
             audio_tensor = torch.from_numpy(session.accumulated_audio).unsqueeze(0).cuda()
             audio_len = torch.tensor([len(session.accumulated_audio)], device='cuda')
 
+            if DEBUG_ASR:
+                audio_hash = _hash_audio(session.accumulated_audio)
+                logger.debug(f"Session {session.id}: process audio={len(session.accumulated_audio)} hash={audio_hash}")
+
             with torch.inference_mode():
                 mel, mel_len = self.model.preprocessor(
                     input_signal=audio_tensor,
                     length=audio_len
                 )
+
+                if DEBUG_ASR:
+                    mel_hash = hashlib.md5(mel.cpu().numpy().tobytes()).hexdigest()[:8]
+                    logger.debug(f"Session {session.id}: mel shape={mel.shape[-1]} hash={mel_hash}")
 
                 # Available frames (excluding last edge frame)
                 available_frames = mel.shape[-1] - 1
