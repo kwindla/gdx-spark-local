@@ -22,6 +22,8 @@ from pipecat.frames.frames import (
     InterimTranscriptionFrame,
     StartFrame,
     TranscriptionFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection
@@ -68,6 +70,14 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         # Diagnostic: track audio bytes sent since last reset
         self._audio_bytes_sent = 0
 
+        # Frame ordering fix: hold UserStoppedSpeakingFrame until final transcript arrives
+        # This prevents the 500ms aggregator timeout when transcript arrives after UserStoppedSpeaking
+        self._waiting_for_final: bool = False
+        self._pending_user_stopped_frame: Optional[UserStoppedSpeakingFrame] = None
+        self._pending_frame_direction: FrameDirection = FrameDirection.DOWNSTREAM
+        self._pending_frame_timeout_task: Optional[asyncio.Task] = None
+        self._pending_frame_timeout_s: float = 0.5  # 500ms fallback timeout
+
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics."""
         return True
@@ -87,6 +97,14 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         Args:
             frame: The end frame.
         """
+        # Clean up pending frame state
+        await self._cancel_pending_frame_timeout()
+        if self._pending_user_stopped_frame:
+            await self.push_frame(
+                self._pending_user_stopped_frame,
+                self._pending_frame_direction
+            )
+            self._pending_user_stopped_frame = None
         # Send final reset to ensure any buffered audio is transcribed
         await self._send_reset()
         await super().stop(frame)
@@ -98,6 +116,10 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         Args:
             frame: The cancel frame.
         """
+        # Clean up pending frame state (discard on cancel)
+        await self._cancel_pending_frame_timeout()
+        self._pending_user_stopped_frame = None
+        self._waiting_for_final = False
         await super().cancel(frame)
         await self._disconnect()
 
@@ -123,16 +145,43 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         """Process frames with NVIDIA-specific handling.
 
+        Implements frame ordering fix to ensure TranscriptionFrame arrives at the
+        aggregator before UserStoppedSpeakingFrame. This prevents the 500ms
+        aggregation timeout that occurs when frames arrive in the wrong order.
+
         Args:
             frame: The frame to process.
             direction: The direction of frame processing.
         """
+        # Handle UserStartedSpeakingFrame - reset pending frame state
+        if isinstance(frame, UserStartedSpeakingFrame):
+            await self._cancel_pending_frame_timeout()
+            self._pending_user_stopped_frame = None
+            self._waiting_for_final = False
+            await super().process_frame(frame, direction)
+            return
+
+        # Handle UserStoppedSpeakingFrame - hold it if waiting for final transcript
+        if isinstance(frame, UserStoppedSpeakingFrame):
+            if self._waiting_for_final:
+                # Hold this frame until final transcript arrives
+                self._pending_user_stopped_frame = frame
+                self._pending_frame_direction = direction
+                self._start_pending_frame_timeout()
+                logger.debug(f"{self} holding UserStoppedSpeakingFrame until final transcript")
+                return  # Don't pass through yet
+            # If not waiting for final, pass through normally
+            await super().process_frame(frame, direction)
+            return
+
+        # All other frames pass through normally
         await super().process_frame(frame, direction)
 
         # Trigger transcript finalization on VAD silence detection.
         # VAD fires after ~200ms of silence, so all speech audio has already
         # been sent. The server adds 480ms silence padding for trailing context.
         if isinstance(frame, VADUserStoppedSpeakingFrame):
+            self._waiting_for_final = True
             await self._send_reset()
 
     async def _send_reset(self):
@@ -152,6 +201,58 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
                     self._audio_bytes_sent = 0
             except Exception as e:
                 logger.error(f"{self} failed to send reset: {e}")
+
+    def _start_pending_frame_timeout(self):
+        """Start timeout task to release pending UserStoppedSpeakingFrame.
+
+        If the final transcript doesn't arrive within the timeout, we release
+        the held frame anyway to prevent the pipeline from getting stuck.
+        """
+        if self._pending_frame_timeout_task:
+            self._pending_frame_timeout_task.cancel()
+        self._pending_frame_timeout_task = asyncio.create_task(
+            self._pending_frame_timeout_handler()
+        )
+
+    async def _pending_frame_timeout_handler(self):
+        """Handle timeout for pending UserStoppedSpeakingFrame."""
+        try:
+            await asyncio.sleep(self._pending_frame_timeout_s)
+            if self._pending_user_stopped_frame:
+                logger.debug(
+                    f"{self} timeout waiting for final transcript, "
+                    f"releasing UserStoppedSpeakingFrame"
+                )
+                await self.push_frame(
+                    self._pending_user_stopped_frame,
+                    self._pending_frame_direction
+                )
+                self._pending_user_stopped_frame = None
+                self._waiting_for_final = False
+        except asyncio.CancelledError:
+            pass
+
+    async def _cancel_pending_frame_timeout(self):
+        """Cancel the pending frame timeout task."""
+        if self._pending_frame_timeout_task:
+            self._pending_frame_timeout_task.cancel()
+            try:
+                await self._pending_frame_timeout_task
+            except asyncio.CancelledError:
+                pass
+            self._pending_frame_timeout_task = None
+
+    async def _release_pending_frame(self):
+        """Release the pending UserStoppedSpeakingFrame after final transcript."""
+        if self._pending_user_stopped_frame:
+            await self._cancel_pending_frame_timeout()
+            logger.debug(f"{self} releasing UserStoppedSpeakingFrame after final transcript")
+            await self.push_frame(
+                self._pending_user_stopped_frame,
+                self._pending_frame_direction
+            )
+            self._pending_user_stopped_frame = None
+            self._waiting_for_final = False
 
     async def _connect(self):
         """Connect to the NVIDIA ASR service."""
@@ -248,6 +349,10 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
     async def _handle_transcript(self, data: dict):
         """Handle a transcript message from the server.
 
+        For final transcripts, releases any pending UserStoppedSpeakingFrame
+        AFTER pushing the transcript. This ensures correct frame ordering at
+        the aggregator, preventing the 500ms timeout.
+
         Args:
             data: The transcript message data.
         """
@@ -263,6 +368,7 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
 
         if is_final:
             logger.debug(f"{self} final transcript: {text[:50]}...")
+            # Push transcript first
             await self.push_frame(
                 TranscriptionFrame(
                     text,
@@ -272,6 +378,8 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
                 )
             )
             await self.stop_processing_metrics()
+            # Then release any pending UserStoppedSpeakingFrame
+            await self._release_pending_frame()
         else:
             logger.trace(f"{self} interim: {text[:30]}...")
             await self.push_frame(
