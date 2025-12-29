@@ -87,6 +87,50 @@ class ChunkedLLMContinueGenerationFrame(SystemFrame):
     pass
 
 
+class LLMSlotMetricsFrame(SystemFrame):
+    """Frame containing LLM slot usage and cache metrics.
+
+    Pushed after LLMFullResponseEndFrame to report slot reuse and cache performance.
+    """
+
+    def __init__(
+        self,
+        slot_id: int,
+        slot_reused: bool,
+        total_chunks: int,
+        total_time_ms: float,
+        tokens_cached: int = 0,
+        tokens_evaluated: int = 0,
+    ):
+        super().__init__()
+        self.slot_id = slot_id
+        self.slot_reused = slot_reused
+        self.total_chunks = total_chunks
+        self.total_time_ms = total_time_ms
+        self.tokens_cached = tokens_cached
+        self.tokens_evaluated = tokens_evaluated
+
+    @property
+    def cache_hit_ratio(self) -> float:
+        """Calculate cache hit ratio (0.0-1.0)."""
+        total = self.tokens_cached + self.tokens_evaluated
+        if total == 0:
+            return 0.0
+        return self.tokens_cached / total
+
+    def __str__(self) -> str:
+        """String representation for logging."""
+        return (
+            f"LLMSlotMetrics(slot={self.slot_id}, reused={self.slot_reused}, "
+            f"chunks={self.total_chunks}, time={self.total_time_ms:.0f}ms, "
+            f"cached={self.tokens_cached}, eval={self.tokens_evaluated}, "
+            f"hit={self.cache_hit_ratio:.1%})"
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
 def ends_at_sentence_boundary(text: str) -> bool:
     """Check if text ends at a sentence boundary.
 
@@ -174,9 +218,14 @@ class LlamaCppChunkedLLMService(AIService):
         self._num_slots = self._params.num_slots
         self._current_slot: int = 0
         self._slot_last_used: dict[int, float] = {}  # slot_id -> timestamp
+        self._last_used_slot: Optional[int] = None  # Track last slot for reuse optimization
 
-        # Metrics
+        # Metrics for current generation
         self._generation_start_time: Optional[float] = None
+        self._generation_slot_id: int = 0
+        self._generation_slot_reused: bool = False
+        self._generation_tokens_cached: int = 0
+        self._generation_tokens_evaluated: int = 0
 
         self.set_model_name("llama-cpp-chunked")
 
@@ -247,24 +296,38 @@ class LlamaCppChunkedLLMService(AIService):
         if self._continue_event:
             self._continue_event.set()
 
-    async def _get_next_slot(self) -> int:
-        """Get next slot to use, waiting if reuse guard is triggered.
+    async def _get_next_slot(self) -> tuple[int, bool]:
+        """Get next slot to use, preferring slot reuse for KV cache hits.
 
-        Alternates between slots (0, 1, 0, 1, ...) and ensures each slot
-        has at least min_slot_reuse_delay_s seconds before being reused.
-        This prevents the GGML_ASSERT(!slot.is_processing()) crash caused
-        by llama.cpp's async cleanup not completing in time.
+        Optimization: If the last used slot has been idle for at least
+        min_slot_reuse_delay_s seconds, reuse it for better KV cache hits.
+        Otherwise, alternate between slots to avoid the GGML_ASSERT crash.
 
         Returns:
-            The slot ID to use for the next request.
+            Tuple of (slot_id, slot_reused) where:
+            - slot_id: The slot ID to use for the next request
+            - slot_reused: True if we're reusing the same slot as last time
         """
+        min_delay = self._params.min_slot_reuse_delay_s
+
+        # Try to reuse the last slot if it's been idle long enough (better KV cache)
+        if self._last_used_slot is not None:
+            last_used = self._slot_last_used.get(self._last_used_slot, 0)
+            elapsed = time.time() - last_used
+            if elapsed >= min_delay:
+                logger.debug(
+                    f"LlamaCppChunkedLLM: Reusing slot {self._last_used_slot} "
+                    f"for KV cache (idle {elapsed:.1f}s)"
+                )
+                return self._last_used_slot, True
+
+        # Otherwise, use the next slot in rotation
         slot = self._current_slot
         self._current_slot = (self._current_slot + 1) % self._num_slots
 
-        # Check reuse guard
+        # Check reuse guard for this slot
         last_used = self._slot_last_used.get(slot, 0)
         elapsed = time.time() - last_used
-        min_delay = self._params.min_slot_reuse_delay_s
 
         if elapsed < min_delay:
             wait_time = min_delay - elapsed
@@ -277,14 +340,16 @@ class LlamaCppChunkedLLMService(AIService):
             while time.time() < wait_end and not self._cancelled:
                 await asyncio.sleep(0.1)  # 100ms increments
 
-        return slot
+        return slot, False
 
     def _mark_slot_used(self, slot: int):
         """Record when a slot's request completed or was cancelled.
 
-        This timestamp is used by _get_next_slot() to enforce the reuse guard.
+        This timestamp is used by _get_next_slot() to enforce the reuse guard
+        and enable slot reuse for KV cache optimization.
         """
         self._slot_last_used[slot] = time.time()
+        self._last_used_slot = slot
 
     def _format_messages(self, messages: list) -> str:
         """Format messages as ChatML prompt with thinking disabled.
@@ -339,6 +404,12 @@ class LlamaCppChunkedLLMService(AIService):
         self._is_first_chunk = True
         self._continue_event = asyncio.Event()
 
+        # Reset metrics for this generation
+        self._generation_slot_id = 0
+        self._generation_slot_reused = False
+        self._generation_tokens_cached = 0
+        self._generation_tokens_evaluated = 0
+
         messages = context.get_messages()
         if not messages:
             logger.warning("LlamaCppChunkedLLM: No messages in context")
@@ -392,14 +463,27 @@ class LlamaCppChunkedLLMService(AIService):
                 logger.debug(f"LlamaCppChunkedLLM: TTS done, continuing generation")
 
             # Log completion metrics
+            elapsed_ms = 0.0
             if self._generation_start_time:
-                elapsed = (time.time() - self._generation_start_time) * 1000
+                elapsed_ms = (time.time() - self._generation_start_time) * 1000
                 logger.info(
-                    f"LlamaCppChunkedLLM: Complete in {elapsed:.0f}ms, "
+                    f"LlamaCppChunkedLLM: Complete in {elapsed_ms:.0f}ms, "
                     f"{chunk_num} chunk{'s' if chunk_num != 1 else ''}"
                 )
 
             await self.push_frame(LLMFullResponseEndFrame())
+
+            # Push slot metrics frame after LLMFullResponseEndFrame
+            metrics_frame = LLMSlotMetricsFrame(
+                slot_id=self._generation_slot_id,
+                slot_reused=self._generation_slot_reused,
+                total_chunks=chunk_num,
+                total_time_ms=elapsed_ms,
+                tokens_cached=self._generation_tokens_cached,
+                tokens_evaluated=self._generation_tokens_evaluated,
+            )
+            logger.debug(f"LlamaCppChunkedLLM: {metrics_frame}")
+            await self.push_frame(metrics_frame)
 
         except Exception as e:
             logger.error(f"LlamaCppChunkedLLM error: {e}")
@@ -413,19 +497,26 @@ class LlamaCppChunkedLLMService(AIService):
         """Generate a single chunk via HTTP streaming to llama.cpp.
 
         Handles:
+        - Slot reuse optimization for KV cache hits
         - Two-slot alternation with reuse guard
         - Pending token prepending (from previous peek)
         - Sentence boundary detection with token peeking
         - First chunk min/max token bounds
         - Cache state tracking (_generated_text)
+        - Cache metrics collection from llama.cpp response
 
         Returns:
             (chunk_text, is_done) where:
             - chunk_text: Text to emit to client (includes prepended pending token)
             - is_done: True if generation is complete (EOS or empty response)
         """
-        # Get next slot (alternates 0, 1, 0, 1, ...) with reuse guard
-        slot_id = await self._get_next_slot()
+        # Get next slot (prefers reuse for KV cache, falls back to alternation)
+        slot_id, slot_reused = await self._get_next_slot()
+
+        # Track slot info on first chunk for metrics
+        if self._is_first_chunk:
+            self._generation_slot_id = slot_id
+            self._generation_slot_reused = slot_reused
 
         if self._cancelled:
             return "", True
@@ -509,6 +600,12 @@ class LlamaCppChunkedLLMService(AIService):
                             if token_text:
                                 collected_text += token_text
                                 collected_tokens += 1
+                            # Capture cache metrics from the stop event
+                            # llama.cpp includes tokens_cached and tokens_evaluated
+                            if "tokens_cached" in data:
+                                self._generation_tokens_cached += data.get("tokens_cached", 0)
+                            if "tokens_evaluated" in data:
+                                self._generation_tokens_evaluated += data.get("tokens_evaluated", 0)
                             hit_eos = True
                             break
 
