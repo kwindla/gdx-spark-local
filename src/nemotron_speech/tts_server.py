@@ -395,7 +395,10 @@ async def websocket_tts_stream(websocket: WebSocket):
             return
 
         speaker_idx = SPEAKERS[stream.voice]
-        stream.state = StreamState.GENERATING
+        # Only set GENERATING if not already closed/cancelled
+        # (close message may arrive before send_audio starts)
+        if stream.state not in (StreamState.CLOSED, StreamState.CANCELLED):
+            stream.state = StreamState.GENERATING
         first_audio_time = None
 
         try:
@@ -479,6 +482,17 @@ async def websocket_tts_stream(websocket: WebSocket):
                         return  # WebSocket closed
 
                     stream.mark_segment_complete()
+
+                    # Check for closed state immediately after segment completes
+                    # This ensures we exit promptly when close() was called during generation
+                    logger.debug(f"[{stream.stream_id[:8]}] After segment complete, checking state={stream.state}")
+                    if stream.state in (StreamState.CLOSED, StreamState.CANCELLED):
+                        async with queue_lock:
+                            queue_len = len(segment_queue)
+                            logger.info(f"[{stream.stream_id[:8]}] State is {stream.state}, queue_len={queue_len}, breaking...")
+                            if not segment_queue:
+                                break
+
                     continue  # Check for more segments immediately
 
                 # Exit when closed/cancelled AND queue empty
@@ -611,8 +625,12 @@ async def websocket_tts_stream(websocket: WebSocket):
                     queue_event.set()
 
             elif msg_type == "close":
+                logger.info(f"[{stream.stream_id[:8] if stream else 'none'}] Close message received, stream_state={stream.state if stream else 'N/A'}")
                 if stream:
                     stream.close()
+                    logger.info(f"[{stream.stream_id[:8]}] After close(), stream_state={stream.state}")
+                else:
+                    logger.warning("Close received but no active stream!")
 
                 # Signal the queue so audio_task can process remaining text and exit
                 queue_event.set()
@@ -721,15 +739,102 @@ def _apply_fade_out(audio_bytes: bytes, fade_ms: int = 20, sample_rate: int = MA
     if not audio_bytes:
         return audio_bytes
 
-    fade_samples = int(sample_rate * fade_ms / 1000)
     audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
 
-    if len(audio) < fade_samples:
+    if len(audio) < 2:
         return audio_bytes
 
-    # Apply fade-out to last fade_ms
+    # Use requested fade length or all available audio if buffer is smaller
+    fade_samples = min(int(sample_rate * fade_ms / 1000), len(audio))
+
+    # Apply fade-out to last fade_samples
     fade_curve = np.linspace(1.0, 0.0, fade_samples, dtype=np.float32)
     audio[-fade_samples:] *= fade_curve
+
+    return np.clip(audio, -32768, 32767).astype(np.int16).tobytes()
+
+
+def _crossfade_to_silence(audio_bytes: bytes, crossfade_ms: int = 40, sample_rate: int = MAGPIE_SAMPLE_RATE) -> bytes:
+    """Crossfade audio into silence, removing decoder artifacts.
+
+    The Magpie decoder sometimes generates a "whoosh" artifact after speech ends -
+    a burst of energy that appears after a period of near-silence. This function:
+    1. Detects if there's a silence-then-artifact pattern
+    2. Truncates at the silence point if artifact is found
+    3. Applies raised cosine fade to reach exactly zero
+
+    Args:
+        audio_bytes: Raw audio bytes (int16)
+        crossfade_ms: Crossfade duration in milliseconds
+        sample_rate: Audio sample rate
+
+    Returns:
+        Audio bytes with smooth fade to silence (ends with zeros)
+    """
+    if not audio_bytes:
+        return audio_bytes
+
+    audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+
+    if len(audio) < 2:
+        return audio_bytes
+
+    # Detect silence-then-artifact pattern (whoosh)
+    # The decoder sometimes generates a burst of energy after the speech ends.
+    # Strategy: Find last sustained silence, check if there's energy after it.
+    window_ms = 5
+    window_samples = int(sample_rate * window_ms / 1000)
+    silence_threshold = 25  # RMS below this is considered silence
+
+    # Analyze last 80ms (the buffer size)
+    analysis_samples = min(len(audio), int(sample_rate * 0.080))
+    start_pos = len(audio) - analysis_samples
+
+    # Compute RMS for each window
+    window_rms = []
+    for i in range(start_pos, len(audio) - window_samples + 1, window_samples):
+        window = audio[i:i + window_samples]
+        rms = np.sqrt(np.mean(window ** 2))
+        window_rms.append((i, rms))
+
+    # Find the last silence point (before any trailing artifact)
+    # Look for pattern: silence (low RMS) followed by bump (high RMS)
+    last_silence_pos = None
+    found_artifact = False
+
+    for i in range(len(window_rms) - 1, -1, -1):
+        pos, rms = window_rms[i]
+        if rms < silence_threshold:
+            # Check if there's significant energy after this silence
+            max_rms_after = max([r for _, r in window_rms[i+1:]], default=0)
+            if max_rms_after > 60:  # Energy spike after silence = artifact
+                last_silence_pos = pos
+                found_artifact = True
+                break
+
+    truncate_point = None
+    if found_artifact and last_silence_pos is not None:
+        truncate_point = last_silence_pos
+        ms_from_end = (len(audio) - truncate_point) / sample_rate * 1000
+        logger.debug(f"Detected trailing artifact, truncating {ms_from_end:.0f}ms from end")
+        audio = audio[:truncate_point]
+
+    if len(audio) < 2:
+        return b'\x00' * 10  # Return minimal silence
+
+    # Apply fade to the entire remaining audio (or just the last crossfade_ms)
+    crossfade_samples = min(int(sample_rate * crossfade_ms / 1000), len(audio))
+
+    # Use raised cosine fade: 0.5 * (1 + cos(π*t)) goes from 1.0 → 0.0 exactly
+    t = np.arange(crossfade_samples, dtype=np.float32) / crossfade_samples
+    fade_curve = 0.5 * (1.0 + np.cos(np.pi * t))
+
+    # Apply fade to the end of audio
+    audio[-crossfade_samples:] *= fade_curve
+
+    # Ensure the last few samples are exactly zero
+    zero_samples = min(5, len(audio))
+    audio[-zero_samples:] = 0
 
     return np.clip(audio, -32768, 32767).astype(np.int16).tobytes()
 
@@ -766,11 +871,83 @@ async def _generate_batch(
     return _apply_fade_out(audio_bytes)
 
 
+# Overlap duration for crossfade between streaming chunks (80ms = 1760 samples = 3520 bytes at 22kHz)
+# Increased from 40ms to 80ms to provide smoother transitions when the non-causal HiFi-GAN
+# vocoder produces uncorrelated waveforms at chunk boundaries due to different future context
+STREAMING_OVERLAP_MS = 80
+STREAMING_OVERLAP_BYTES = int(MAGPIE_SAMPLE_RATE * STREAMING_OVERLAP_MS / 1000) * 2
+
+
+def _overlap_add(chunk1_tail: bytes, chunk2_head: bytes) -> bytes:
+    """Blend overlapping audio regions using adaptive crossfade.
+
+    The HiFi-GAN vocoder produces different waveforms for the same time period
+    depending on future context. When correlation is high, audio represents the
+    same signal and Hann overlap-add works. When correlation is low/negative,
+    the waveforms are different and we use a simple crossfade instead.
+
+    Args:
+        chunk1_tail: Tail of previous chunk (overlap region)
+        chunk2_head: Head of current chunk (overlapping time period)
+
+    Returns:
+        Blended audio (same length as inputs)
+    """
+    if len(chunk1_tail) != len(chunk2_head):
+        raise ValueError(f"Overlap regions must match: {len(chunk1_tail)} vs {len(chunk2_head)}")
+
+    if not chunk1_tail:
+        return b""
+
+    # Convert to float for processing
+    a1 = np.frombuffer(chunk1_tail, dtype=np.int16).astype(np.float32)
+    a2 = np.frombuffer(chunk2_head, dtype=np.int16).astype(np.float32)
+
+    # Measure correlation and amplitude to determine blending strategy
+    corr = np.corrcoef(a1, a2)[0, 1] if len(a1) > 1 else 0
+    diff_rms = np.sqrt(np.mean((a1 - a2) ** 2))
+    a1_rms = np.sqrt(np.mean(a1 ** 2))
+    a2_rms = np.sqrt(np.mean(a2 ** 2))
+
+    n = len(a1)
+    t = np.arange(n, dtype=np.float32) / n
+
+    # Adaptive blending based on correlation:
+    # - High correlation (>0.5): Hann overlap-add (COLA) - audio is similar
+    # - Low correlation: Equal-power crossfade - maintains constant energy during transition
+    if corr > 0.5:
+        # Hann window halves - sum to 1.0 at every point (COLA constraint)
+        w1 = 0.5 * (1.0 + np.cos(np.pi * t))  # 1.0 → 0.0
+        w2 = 0.5 * (1.0 - np.cos(np.pi * t))  # 0.0 → 1.0
+        blend_type = "hann"
+    else:
+        # Equal-power crossfade for uncorrelated audio (w1² + w2² = 1)
+        # This maintains constant energy during the transition, reducing perceived "pop"
+        # For uncorrelated signals, linear crossfade causes a 3dB dip at the midpoint
+        w1 = np.cos(np.pi * t / 2)   # 1.0 → 0.0 (smooth)
+        w2 = np.sin(np.pi * t / 2)   # 0.0 → 1.0 (smooth)
+        blend_type = "equal-power"
+
+    logger.debug(f"Overlap-add ({n} samples, {n/MAGPIE_SAMPLE_RATE*1000:.0f}ms): "
+                 f"corr={corr:.3f}, diff_rms={diff_rms:.0f}, blend={blend_type}")
+
+    blended = a1 * w1 + a2 * w2
+
+    return np.clip(blended, -32768, 32767).astype(np.int16).tobytes()
+
+
 async def _generate_streaming_with_preset(
     model, text: str, language: str, speaker_idx: int, preset: str = "conservative",
     cancel_event: Optional[threading.Event] = None
 ) -> AsyncGenerator[bytes, None]:
     """Generate audio using streaming mode with configurable preset.
+
+    Uses COLA-compliant overlap-add to seamlessly blend chunk boundaries:
+    1. StreamingMagpieTTS preserves 10ms overlap at chunk heads (same audio, different decode context)
+    2. We blend overlapping regions using Hann windows (w1 + w2 = 1.0 at all points)
+    3. Apply fade-out at the end to eliminate the pssht artifact
+
+    This achieves zero audio loss - the overlap represents redundant content (same time period).
 
     Args:
         preset: "aggressive" (~185ms TTFB), "balanced" (~280ms), "conservative" (~370ms, default)
@@ -785,7 +962,7 @@ async def _generate_streaming_with_preset(
     base_config = STREAMING_PRESETS.get(preset, STREAMING_PRESETS["conservative"])
     config = replace(base_config,
         use_cfg=True,       # Enable CFG for quality
-        use_crossfade=False # Disable crossfade - causes audio artifacts at chunk boundaries
+        use_crossfade=False # Crossfade handled here in post-vocoder audio buffer, not in decoder
     )
 
     chunk_queue: queue.Queue = queue.Queue()
@@ -816,33 +993,93 @@ async def _generate_streaming_with_preset(
     gen_thread = threading.Thread(target=run_generation, daemon=True)
     gen_thread.start()
 
-    # Track last chunk to apply fade-out at the end
-    # We yield chunks immediately (no buffering) for low TTFB,
-    # then send a fade-out tail after the last chunk
-    last_chunk: bytes | None = None
+    # Audio buffer for overlap-add at chunk boundaries
+    # Chunks now have preserved overlap at their heads (same time period as previous tail)
+    audio_buffer: bytes = b""
+    overlap_bytes = STREAMING_OVERLAP_BYTES
+    chunk_idx = 0
+
+    def process_chunk(chunk: bytes) -> bytes | None:
+        """Process a chunk with COLA overlap-add. Returns bytes to yield or None."""
+        nonlocal audio_buffer, chunk_idx
+        chunk_idx += 1
+
+        if not chunk:
+            return None
+
+        if not audio_buffer:
+            # First chunk: no overlap to blend, just buffer the tail for next chunk
+            if len(chunk) > overlap_bytes:
+                audio_buffer = chunk[-overlap_bytes:]
+                return chunk[:-overlap_bytes]
+            else:
+                # Tiny first chunk - buffer entirely
+                audio_buffer = chunk
+                return None
+        else:
+            # Subsequent chunk: chunk[:overlap_bytes] overlaps with audio_buffer
+            # Both represent the same time period - blend using Hann overlap-add
+            effective_overlap = min(overlap_bytes, len(audio_buffer), len(chunk) // 2)
+
+            if effective_overlap > 0 and len(chunk) >= 2 * effective_overlap:
+                # Normal path: overlap-add, yield middle, buffer tail
+                blended = _overlap_add(
+                    audio_buffer[-effective_overlap:],
+                    chunk[:effective_overlap]
+                )
+                # Yield: excess buffer (if any) + blended overlap + middle of chunk
+                excess = audio_buffer[:-effective_overlap] if len(audio_buffer) > effective_overlap else b""
+                middle = chunk[effective_overlap:-overlap_bytes]
+                audio_buffer = chunk[-overlap_bytes:]
+                return excess + blended + middle
+            else:
+                # Edge case: chunk too small - concatenate and re-buffer
+                combined = audio_buffer + chunk
+                if len(combined) > overlap_bytes:
+                    audio_buffer = combined[-overlap_bytes:]
+                    return combined[:-overlap_bytes]
+                else:
+                    audio_buffer = combined
+                    return None
+
+    def yield_final_buffer():
+        """Yield the final audio buffer with fade-out applied."""
+        if not audio_buffer:
+            return None
+        # Check if buffer is already near-silent (no need to fade)
+        buf_arr = np.frombuffer(audio_buffer, dtype=np.int16).astype(np.float32)
+        buf_rms = np.sqrt(np.mean(buf_arr ** 2))
+        if buf_rms < 50:
+            return audio_buffer
+        # Apply crossfade to silence for natural ending
+        return _crossfade_to_silence(audio_buffer, crossfade_ms=40)
 
     while True:
         try:
             chunk = chunk_queue.get(timeout=0.001)
             if chunk is None:
-                # Generation done - send fade-out tail based on last chunk
-                if last_chunk:
-                    yield _generate_fade_out_tail(last_chunk)
+                # Generation done - yield final buffer
+                final = yield_final_buffer()
+                if final:
+                    yield final
                 break
-            yield chunk
-            last_chunk = chunk
+            to_yield = process_chunk(chunk)
+            if to_yield:
+                yield to_yield
         except queue.Empty:
             if generation_done:
+                # Drain any remaining chunks from queue
                 while True:
                     try:
                         chunk = chunk_queue.get_nowait()
                         if chunk is None:
-                            # Send fade-out tail based on last chunk
-                            if last_chunk:
-                                yield _generate_fade_out_tail(last_chunk)
+                            final = yield_final_buffer()
+                            if final:
+                                yield final
                             break
-                        yield chunk
-                        last_chunk = chunk
+                        to_yield = process_chunk(chunk)
+                        if to_yield:
+                            yield to_yield
                     except queue.Empty:
                         break
                 break

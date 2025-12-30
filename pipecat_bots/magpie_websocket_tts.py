@@ -390,6 +390,7 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
                         segment = msg.get("segment", 0)
                         audio_ms = msg.get("audio_ms", 0)
                         logger.debug(f"WS segment {segment} complete: {audio_ms:.0f}ms audio")
+
                         # After first segment completes, subsequent segments use batch mode
                         self._is_first_segment = False
                         self._first_audio_received = False  # Reset for next segment TTFB

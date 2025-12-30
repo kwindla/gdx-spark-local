@@ -243,7 +243,14 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
             self._pending_frame_timeout_task = None
 
     async def _release_pending_frame(self):
-        """Release the pending UserStoppedSpeakingFrame after final transcript."""
+        """Release the pending UserStoppedSpeakingFrame after final transcript.
+
+        Always resets _waiting_for_final since the final transcript has arrived.
+        If UserStoppedSpeakingFrame arrives later, it should pass through normally.
+        """
+        # Always reset waiting state - the final transcript has arrived
+        self._waiting_for_final = False
+
         if self._pending_user_stopped_frame:
             await self._cancel_pending_frame_timeout()
             logger.debug(f"{self} releasing UserStoppedSpeakingFrame after final transcript")
@@ -252,7 +259,6 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
                 self._pending_frame_direction
             )
             self._pending_user_stopped_frame = None
-            self._waiting_for_final = False
 
     async def _connect(self):
         """Connect to the NVIDIA ASR service."""

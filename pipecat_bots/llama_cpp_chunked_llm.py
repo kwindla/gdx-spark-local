@@ -236,6 +236,10 @@ class LlamaCppChunkedLLMService(AIService):
             f"{self._params.first_chunk_max_tokens})"
         )
 
+    def can_generate_metrics(self) -> bool:
+        """Check if this service can generate processing metrics."""
+        return True
+
     async def start(self, frame: StartFrame):
         """Handle StartFrame - create HTTP client."""
         await super().start(frame)
@@ -419,6 +423,8 @@ class LlamaCppChunkedLLMService(AIService):
 
         try:
             await self.push_frame(LLMFullResponseStartFrame())
+            await self.start_ttfb_metrics()
+            await self.start_processing_metrics()
             self._generation_start_time = time.time()
 
             # Format prompt once (generated_text is appended for each chunk)
@@ -439,6 +445,9 @@ class LlamaCppChunkedLLMService(AIService):
 
                 if chunk_text:
                     chunk_num += 1
+                    # Stop TTFB metrics on first chunk
+                    if self._is_first_chunk:
+                        await self.stop_ttfb_metrics()
                     logger.debug(
                         f"LlamaCppChunkedLLM chunk {chunk_num}: {len(chunk_text)} chars, "
                         f"'{chunk_text[:40]}{'...' if len(chunk_text) > 40 else ''}'"
@@ -471,6 +480,7 @@ class LlamaCppChunkedLLMService(AIService):
                     f"{chunk_num} chunk{'s' if chunk_num != 1 else ''}"
                 )
 
+            await self.stop_processing_metrics()
             await self.push_frame(LLMFullResponseEndFrame())
 
             # Push slot metrics frame after LLMFullResponseEndFrame
@@ -487,6 +497,7 @@ class LlamaCppChunkedLLMService(AIService):
 
         except Exception as e:
             logger.error(f"LlamaCppChunkedLLM error: {e}")
+            await self.stop_processing_metrics()
             await self.push_frame(ErrorFrame(error=str(e)))
             await self.push_frame(LLMFullResponseEndFrame())
         finally:
