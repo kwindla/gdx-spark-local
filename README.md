@@ -2,22 +2,18 @@
 
 Local voice agent infrastructure for NVIDIA DGX Spark or RTX 5090. Runs ASR, TTS, and LLM entirely on-device in a unified container.
 
+Uses three NVIDIA open weights models, with streaming and interleaved LLM and TTS chunking, with the goal of fast conversational response. Voice-to-voice inference latency from the time the user stops speaking to the time the bot starts speaking is 800-1200ms on DGX Spark with Nemotron-3-Nano Q8, and 500-800ms on RTX 5090 with Nemotron-3-Nano Q4.
+
 ## Architecture
 
 ```
 Host: uv run pipecat_bots/bot_interleaved_streaming.py
-  ├── ASR:  ws://localhost:8080   (Parakeet 600M)
-  ├── TTS:  ws://localhost:8001   (Magpie 357M WebSocket)
-  └── LLM:  http://localhost:8000 (llama.cpp, Nemotron-3-Nano Q8)
-
-┌─────────────────────────────────────────────────┐
-│  nemotron unified container                     │
-│  ├─ ASR server (port 8080) - ~3GB VRAM          │
-│  ├─ TTS server (port 8001) - ~2GB VRAM          │
-│  └─ LLM server (port 8000) - ~32GB VRAM (Q8)    │
-│     (llama.cpp, --parallel 2 for two-slot)      │
-└─────────────────────────────────────────────────┘
+  ├── ASR:  ws://localhost:8080   (Parakeet 600M Pipecat WebSocket)
+  ├── LLM:  http://localhost:8000 (llama.cpp, Nemotron-3-Nano Q8)
+  └── TTS:  ws://localhost:8001   (Magpie 357M Pipecat WebSocket)
 ```
+
+Detailed architecture notes are in [docs/streaming-pipeline-architecture.md](docs/streaming-pipeline-architecture.md).
 
 ## Quick Start
 
