@@ -262,7 +262,6 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
         if self._websocket:
             try:
                 await self._websocket.send(json.dumps({"type": "cancel"}))
-                logger.debug(f"WS cancel sent (interruption, gen={self._gen})")
             except Exception as e:
                 logger.debug(f"Failed to send cancel: {e}")
 
@@ -363,10 +362,6 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
 
                 if not self._first_audio_received:
                     await self.stop_ttfb_metrics()
-                    if self._stream_start_time:
-                        ttfb_ms = (time.time() - self._stream_start_time) * 1000
-                        mode = "stream" if self._is_first_segment else "batch"
-                        logger.info(f"MagpieWebSocketTTS TTFB: {ttfb_ms:.0f}ms (mode={mode})")
                     self._first_audio_received = True
 
                 await self.push_frame(
@@ -380,10 +375,8 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
                     msg_type = msg.get("type")
 
                     if msg_type == "stream_created":
-                        stream_id = msg.get("stream_id", "")[:8]
                         # Confirm this generation - audio after this point is valid
                         self._confirmed_gen = self._gen
-                        logger.debug(f"WS stream created: {stream_id} (gen={self._gen})")
 
                     elif msg_type == "segment_complete":
                         # Segment done, switch to batch mode for subsequent segments
@@ -402,17 +395,12 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
                                 silence = self._generate_silence_frames(
                                     self._params.sentence_pause_ms
                                 )
-                                logger.info(
-                                    f"Injecting {self._params.sentence_pause_ms}ms silence "
-                                    f"after segment {segment}"
-                                )
                                 await self.push_frame(
                                     TTSAudioRawFrame(silence, self.sample_rate, 1)
                                 )
 
                         # Signal ChunkedLLMService that this segment is complete
                         # so it can continue generating the next chunk
-                        logger.debug(f"Signaling LLM to continue after segment {segment}")
                         await self.push_frame(
                             ChunkedLLMContinueGenerationFrame(),
                             FrameDirection.UPSTREAM
@@ -450,9 +438,6 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
         if self._websocket and self._stream_active:
             try:
                 await self._websocket.send(json.dumps({"type": "close"}))
-                logger.debug("WS chunk stream close sent (flush)")
-                # Reset for next response - done message handler also resets this
-                # but we set it here too in case done message is delayed
             except Exception as e:
                 logger.debug(f"Failed to send close: {e}")
 
@@ -499,8 +484,6 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
                 self._is_first_segment = True  # First segment of new response
                 await self.start_ttfb_metrics()
                 yield TTSStartedFrame()
-
-            await self.start_tts_usage_metrics(text)
 
             # Build text message with mode selection
             msg = {"type": "text", "text": text}

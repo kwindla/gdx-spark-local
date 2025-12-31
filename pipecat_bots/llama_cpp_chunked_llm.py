@@ -76,8 +76,8 @@ DEFAULT_NUM_SLOTS = 2
 
 # Minimum time (seconds) before reusing the same slot
 # This ensures any async cleanup from cancelled requests is complete
-# 2 seconds is conservative - typical TTS takes 1-2s per chunk anyway
-DEFAULT_MIN_SLOT_REUSE_DELAY_S = 2.0
+# 1 second is conservative - cleanup completes in milliseconds
+DEFAULT_MIN_SLOT_REUSE_DELAY_S = 1.0
 
 
 class ChunkedLLMContinueGenerationFrame(SystemFrame):
@@ -246,7 +246,18 @@ class LlamaCppChunkedLLMService(AIService):
     async def start(self, frame: StartFrame):
         """Handle StartFrame - create HTTP client."""
         await super().start(frame)
-        self._client = httpx.AsyncClient(timeout=300.0)
+        # Workaround for llama.cpp server crash (2025-12-31):
+        # When using connection pooling, HTTP connections return to the pool after
+        # a request completes. When the pool later closes a connection, llama.cpp
+        # interprets the TCP close as a cancel signal. If a new task has started
+        # on the same slot, the cancel handler sees slot.is_processing()=true and
+        # hits GGML_ASSERT(!slot.is_processing()) in server-context.cpp:1011.
+        # Disabling pooling ensures connections close immediately after each request,
+        # so any cancel signal arrives while the slot is still idle.
+        self._client = httpx.AsyncClient(
+            timeout=300.0,
+            limits=httpx.Limits(max_keepalive_connections=0),
+        )
         logger.debug("LlamaCppChunkedLLM: HTTP client created")
 
     async def stop(self, frame: EndFrame):
@@ -276,7 +287,6 @@ class LlamaCppChunkedLLMService(AIService):
         # Handle TTS continue signal (upstream)
         if isinstance(frame, ChunkedLLMContinueGenerationFrame):
             if self._continue_event:
-                logger.debug("LlamaCppChunkedLLM: Received continue signal from TTS")
                 self._continue_event.set()
             return  # Don't propagate
 
@@ -296,7 +306,6 @@ class LlamaCppChunkedLLMService(AIService):
 
     async def _handle_interruption(self, frame: InterruptionFrame):
         """Handle interruption by cancelling current generation."""
-        logger.info("LlamaCppChunkedLLM: Interruption received, cancelling")
         self._cancelled = True
         self._generating = False
         self._is_first_chunk = True
@@ -396,7 +405,10 @@ class LlamaCppChunkedLLMService(AIService):
         """Process LLM context and generate response in chunks."""
         # Ensure HTTP client exists
         if not self._client:
-            self._client = httpx.AsyncClient(timeout=300.0)
+            self._client = httpx.AsyncClient(
+                timeout=300.0,
+                limits=httpx.Limits(max_keepalive_connections=0),
+            )
 
         # Cancel any existing generation and wait for it to exit
         if self._generating:
@@ -461,10 +473,6 @@ class LlamaCppChunkedLLMService(AIService):
                     # Stop TTFB metrics on first chunk
                     if self._is_first_chunk:
                         await self.stop_ttfb_metrics()
-                    logger.debug(
-                        f"LlamaCppChunkedLLM chunk {chunk_num}: {len(chunk_text)} chars, "
-                        f"'{chunk_text[:40]}{'...' if len(chunk_text) > 40 else ''}'"
-                    )
                     await self.push_frame(LLMTextFrame(text=chunk_text))
                     self._is_first_chunk = False
 
@@ -472,7 +480,6 @@ class LlamaCppChunkedLLMService(AIService):
                     break
 
                 # Wait for TTS to finish before generating next chunk
-                logger.debug(f"LlamaCppChunkedLLM: Waiting for TTS segment {chunk_num}")
                 try:
                     await asyncio.wait_for(self._continue_event.wait(), timeout=30.0)
                 except asyncio.TimeoutError:
@@ -482,7 +489,6 @@ class LlamaCppChunkedLLMService(AIService):
                     break
 
                 self._continue_event.clear()
-                logger.debug(f"LlamaCppChunkedLLM: TTS done, continuing generation")
 
             # Log completion metrics
             elapsed_ms = 0.0
@@ -584,8 +590,6 @@ class LlamaCppChunkedLLMService(AIService):
             max_tokens = None
             request_max = 200  # Reasonable sentence limit
 
-        logger.debug(f"LlamaCppChunkedLLM: Using slot {slot_id}")
-
         payload = {
             "prompt": full_prompt,
             "n_predict": request_max,
@@ -611,7 +615,6 @@ class LlamaCppChunkedLLMService(AIService):
             prepended_from_pending = self._pending_token
             collected_text = self._pending_token
             collected_tokens = 1
-            logger.debug(f"LlamaCppChunkedLLM: Prepending pending token: '{self._pending_token}'")
             self._pending_token = None
 
         try:
@@ -646,8 +649,6 @@ class LlamaCppChunkedLLMService(AIService):
                     # Check for EOS/stop token
                     if data.get("stop"):
                         stop_type = data.get("stop_type", "")
-                        # Log stop event to verify cache metric field names
-                        logger.info(f"LlamaCppChunkedLLM: Stop event: {data}")
                         if stop_type in ("eos", "word"):
                             if token_text:
                                 collected_text += token_text
@@ -698,7 +699,6 @@ class LlamaCppChunkedLLMService(AIService):
                         else:
                             # Token starts next sentence - save for next chunk
                             self._pending_token = token_text
-                            logger.debug(f"LlamaCppChunkedLLM: Saving peek token: '{token_text}'")
                             break
 
                     collected_text += token_text

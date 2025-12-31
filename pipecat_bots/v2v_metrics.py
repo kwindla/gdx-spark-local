@@ -44,7 +44,6 @@ class V2VMetricsProcessor(FrameProcessor):
         if isinstance(frame, VADUserStoppedSpeakingFrame):
             # User stopped speaking - start timing
             self._vad_stopped_time = time.time()
-            logger.debug("V2VMetrics: VAD user stopped speaking, starting timer")
 
         elif isinstance(frame, BotStartedSpeakingFrame):
             # Bot started speaking - calculate and emit metric

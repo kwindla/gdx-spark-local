@@ -1,6 +1,6 @@
 # Nemotron-Speech
 
-Local voice agent infrastructure for NVIDIA DGX Spark (Blackwell GB10). Runs ASR, TTS, and LLM entirely on-device in a unified container.
+Local voice agent infrastructure for NVIDIA DGX Spark or RTX 5090. Runs ASR, TTS, and LLM entirely on-device in a unified container.
 
 ## Architecture
 
@@ -73,17 +73,16 @@ Production bot with interleaved streaming for lowest latency:
 - **VAD**: SmartTurn analyzer with 340ms silence threshold
 
 ```bash
-uv run pipecat_bots/bot_interleaved_streaming.py
-uv run pipecat_bots/bot_interleaved_streaming.py -t daily   # Daily transport
-uv run pipecat_bots/bot_interleaved_streaming.py -t webrtc  # SmallWebRTC transport
+uv run pipecat_bots/bot_interleaved_streaming.py            # SmallWebRTC transport
+uv run pipecat_bots/bot_interleaved_streaming.py -t daily   # Daily WebRTC transport
 ```
 
 ### bot_simple_vad.py
 
-Testing/debugging bot without SmartTurn:
+Testing/debugging bot without Smart Turn:
 - Same services as `bot_interleaved_streaming.py`
 - Uses simple Silero VAD with 800ms silence threshold
-- Better for evaluating ASR accuracy without turn prediction interference
+
 
 ```bash
 uv run pipecat_bots/bot_simple_vad.py
@@ -91,7 +90,7 @@ uv run pipecat_bots/bot_simple_vad.py
 
 ### bot_vllm.py
 
-Higher quality inference with vLLM:
+LLM inference with vLLM, supports full BF16 Nemotron 3 Nanoweights:
 - **LLM**: `OpenAILLMService` - vLLM with full BF16 weights
 - **TTS**: `MagpieWebSocketTTSService` - batch mode
 - **VAD**: SmartTurn analyzer with 340ms silence threshold
@@ -384,13 +383,6 @@ The pause happens *after* the audio plays, not before, preserving low TTFB.
 **LLM crashes with `GGML_ASSERT(!slot.is_processing())`**:
 - Ensure `--parallel 2` is set on llama-server (default in unified container)
 - The two-slot implementation prevents this by alternating slots
-
-**Stale audio after interruption**:
-- Fixed by generation counter in `MagpieWebSocketTTSService`
-- Audio is discarded until `stream_created` confirms current generation
-
-**CUDA errors after long idle**:
-- Restart the container: `./scripts/nemotron.sh restart`
 
 **vLLM takes 10-15 minutes to start**:
 - This is normal for first startup (model loading, kernel compilation)
