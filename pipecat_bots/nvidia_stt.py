@@ -8,6 +8,7 @@
 
 import asyncio
 import json
+import time
 from typing import AsyncGenerator, Optional
 
 import websockets
@@ -20,12 +21,14 @@ from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
     InterimTranscriptionFrame,
+    MetricsFrame,
     StartFrame,
     TranscriptionFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
     VADUserStoppedSpeakingFrame,
 )
+from pipecat.metrics.metrics import TTFBMetricsData
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.utils.time import time_now_iso8601
@@ -77,6 +80,9 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         self._pending_frame_direction: FrameDirection = FrameDirection.DOWNSTREAM
         self._pending_frame_timeout_task: Optional[asyncio.Task] = None
         self._pending_frame_timeout_s: float = 0.5  # 500ms fallback timeout
+
+        # STT processing time metric: VADUserStoppedSpeaking -> final transcript
+        self._vad_stopped_time: Optional[float] = None
 
     def can_generate_metrics(self) -> bool:
         """Check if this service can generate processing metrics."""
@@ -158,6 +164,7 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
             await self._cancel_pending_frame_timeout()
             self._pending_user_stopped_frame = None
             self._waiting_for_final = False
+            self._vad_stopped_time = None  # Reset STT metric timer
             await super().process_frame(frame, direction)
             return
 
@@ -182,6 +189,7 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         # been sent. The server adds 480ms silence padding for trailing context.
         if isinstance(frame, VADUserStoppedSpeakingFrame):
             self._waiting_for_final = True
+            self._vad_stopped_time = time.time()  # Start STT metric timer
             await self._send_reset()
 
     async def _send_reset(self):
@@ -384,6 +392,22 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
                 )
             )
             await self.stop_processing_metrics()
+
+            # Emit STT processing time metric
+            if self._vad_stopped_time is not None:
+                processing_time = time.time() - self._vad_stopped_time
+                logger.info(f"{self} NemotronSTT TTFB: {processing_time*1000:.0f}ms")
+                metrics_frame = MetricsFrame(
+                    data=[
+                        TTFBMetricsData(
+                            processor="NemotronSTT",
+                            value=processing_time,
+                        )
+                    ]
+                )
+                await self.push_frame(metrics_frame)
+                self._vad_stopped_time = None
+
             # Then release any pending UserStoppedSpeakingFrame
             await self._release_pending_frame()
         else:

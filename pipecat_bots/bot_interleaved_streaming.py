@@ -9,6 +9,7 @@
 #   NVIDIA_ASR_URL        ASR WebSocket URL (default: ws://localhost:8080)
 #   NVIDIA_LLAMA_CPP_URL  llama.cpp API URL (default: http://localhost:8000)
 #   NVIDIA_TTS_URL        Magpie TTS server URL (default: http://localhost:8001)
+#   ENABLE_RECORDING      Enable audio recording (default: false)
 #
 # Usage:
 #   uv run pipecat_bots/bot_interleaved_streaming.py
@@ -16,7 +17,12 @@
 #   uv run pipecat_bots/bot_interleaved_streaming.py -t webrtc
 #
 
+import asyncio
 import os
+import wave
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -31,6 +37,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
@@ -42,6 +49,7 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from nvidia_stt import NVidiaWebSocketSTTService
 from magpie_websocket_tts import MagpieWebSocketTTSService
 from llama_cpp_chunked_llm import LlamaCppChunkedLLMService
+from v2v_metrics import V2VMetricsProcessor
 
 load_dotenv(override=True)
 
@@ -50,27 +58,58 @@ NVIDIA_ASR_URL = os.getenv("NVIDIA_ASR_URL", "ws://localhost:8080")
 NVIDIA_LLAMA_CPP_URL = os.getenv("NVIDIA_LLAMA_CPP_URL", "http://localhost:8000")
 NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
 
+# Audio recording configuration
+ENABLE_RECORDING = os.getenv("ENABLE_RECORDING", "false").lower() == "true"
+RECORDINGS_DIR = Path(__file__).parent.parent / "recordings"
+
+# VAD configuration - used by both VAD analyzer and V2V metrics
+VAD_STOP_SECS = 0.2
+
+
+def ensure_recordings_dir() -> Path:
+    """Create recordings directory if it doesn't exist."""
+    RECORDINGS_DIR.mkdir(exist_ok=True)
+    return RECORDINGS_DIR
+
+
+async def save_audio_file(audio: bytes, sample_rate: int, num_channels: int, filepath: Path):
+    """Save audio bytes to WAV file using asyncio.to_thread for non-blocking I/O."""
+
+    def _write_wav():
+        buffer = BytesIO()
+        with wave.open(buffer, "wb") as wf:
+            wf.setnchannels(num_channels)
+            wf.setsampwidth(2)  # 16-bit audio
+            wf.setframerate(sample_rate)
+            wf.writeframes(audio)
+
+        with open(filepath, "wb") as f:
+            f.write(buffer.getvalue())
+
+    try:
+        await asyncio.to_thread(_write_wav)
+        logger.info(f"Saved recording: {filepath} ({len(audio)} bytes, {sample_rate}Hz, {num_channels}ch)")
+    except Exception as e:
+        logger.error(f"Failed to save recording to {filepath}: {e}")
+
 # Transport configurations with VAD and SmartTurn analyzer
-# stop_secs=0.34 aligns with ASR model's trailing context requirements:
-# - At 16kHz/20ms chunks, 340ms VAD silence = ~320ms at server (minus triggering chunk)
-# - ASR needs (right_context+1)*160ms = 320ms trailing silence for finalization
 transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
 }
@@ -82,6 +121,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"  LLM URL: {NVIDIA_LLAMA_CPP_URL}")
     logger.info(f"  TTS URL: {NVIDIA_TTS_URL}")
     logger.info(f"  Transport: {type(transport).__name__}")
+    logger.info(f"  Recording: {'enabled' if ENABLE_RECORDING else 'disabled'}")
+    logger.info(f"  VAD stop_secs: {VAD_STOP_SECS}s")
 
     # NVIDIA Parakeet ASR via WebSocket
     stt = NVidiaWebSocketSTTService(
@@ -113,6 +154,28 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     )
     logger.info("Using LlamaCppChunkedLLMService (sentence-boundary streaming)")
 
+    # Voice-to-voice response time metrics
+    v2v_metrics = V2VMetricsProcessor(vad_stop_secs=VAD_STOP_SECS)
+
+    # Audio recording - stereo: user (left), bot (right)
+    # Only create if recording is enabled
+    audiobuffer = AudioBufferProcessor(num_channels=2) if ENABLE_RECORDING else None
+
+    if audiobuffer:
+
+        @audiobuffer.event_handler("on_audio_data")
+        async def on_audio_data(buffer, audio: bytes, sample_rate: int, num_channels: int):
+            """Save combined conversation audio when recording completes."""
+            if len(audio) == 0:
+                logger.warning("No audio data to save")
+                return
+
+            ensure_recordings_dir()
+            # Use microseconds for filename uniqueness
+            timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S-%f")
+            filepath = RECORDINGS_DIR / f"{timestamp}.wav"
+            await save_audio_file(audio, sample_rate, num_channels, filepath)
+
     messages = [
         {
             "role": "system",
@@ -138,18 +201,25 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # RTVI processor for client communication
     rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
 
-    pipeline = Pipeline(
-        [
-            transport.input(),
-            rtvi,
-            stt,
-            context_aggregator.user(),
-            llm,
-            tts,
-            transport.output(),
-            context_aggregator.assistant(),
-        ]
-    )
+    # Build pipeline processors
+    pipeline_processors = [
+        transport.input(),
+        rtvi,
+        stt,
+        context_aggregator.user(),
+        llm,
+        tts,
+        v2v_metrics,
+        transport.output(),
+    ]
+
+    # Add audio buffer if recording is enabled
+    if audiobuffer:
+        pipeline_processors.append(audiobuffer)
+
+    pipeline_processors.append(context_aggregator.assistant())
+
+    pipeline = Pipeline(pipeline_processors)
 
     task = PipelineTask(
         pipeline,
@@ -164,6 +234,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     @rtvi.event_handler("on_client_ready")
     async def on_client_ready(rtvi):
         logger.info("RTVI client ready")
+        if audiobuffer:
+            await audiobuffer.start_recording()
+            logger.info("Recording started")
         await rtvi.set_bot_ready()
         await task.queue_frames([LLMRunFrame()])
 

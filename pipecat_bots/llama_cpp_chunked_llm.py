@@ -45,9 +45,11 @@ from pipecat.frames.frames import (
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
     LLMTextFrame,
+    MetricsFrame,
     StartFrame,
     SystemFrame,
 )
+from pipecat.metrics.metrics import LLMTokenUsage, LLMUsageMetricsData
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.ai_service import AIService
@@ -226,6 +228,7 @@ class LlamaCppChunkedLLMService(AIService):
         self._generation_slot_reused: bool = False
         self._generation_tokens_cached: int = 0
         self._generation_tokens_evaluated: int = 0
+        self._generation_tokens_predicted: int = 0  # Completion tokens
 
         self.set_model_name("llama-cpp-chunked")
 
@@ -319,7 +322,7 @@ class LlamaCppChunkedLLMService(AIService):
             last_used = self._slot_last_used.get(self._last_used_slot, 0)
             elapsed = time.time() - last_used
             if elapsed >= min_delay:
-                logger.debug(
+                logger.info(
                     f"LlamaCppChunkedLLM: Reusing slot {self._last_used_slot} "
                     f"for KV cache (idle {elapsed:.1f}s)"
                 )
@@ -328,6 +331,15 @@ class LlamaCppChunkedLLMService(AIService):
         # Otherwise, use the next slot in rotation
         slot = self._current_slot
         self._current_slot = (self._current_slot + 1) % self._num_slots
+        if self._last_used_slot is None:
+            logger.info(f"LlamaCppChunkedLLM: Using slot {slot} (first request)")
+        else:
+            last_used = self._slot_last_used.get(self._last_used_slot, 0)
+            elapsed = time.time() - last_used
+            logger.info(
+                f"LlamaCppChunkedLLM: Rotating to slot {slot} "
+                f"(slot {self._last_used_slot} only idle {elapsed:.1f}s < {min_delay}s)"
+            )
 
         # Check reuse guard for this slot
         last_used = self._slot_last_used.get(slot, 0)
@@ -413,6 +425,7 @@ class LlamaCppChunkedLLMService(AIService):
         self._generation_slot_reused = False
         self._generation_tokens_cached = 0
         self._generation_tokens_evaluated = 0
+        self._generation_tokens_predicted = 0
 
         messages = context.get_messages()
         if not messages:
@@ -484,7 +497,7 @@ class LlamaCppChunkedLLMService(AIService):
             await self.push_frame(LLMFullResponseEndFrame())
 
             # Push slot metrics frame after LLMFullResponseEndFrame
-            metrics_frame = LLMSlotMetricsFrame(
+            slot_metrics_frame = LLMSlotMetricsFrame(
                 slot_id=self._generation_slot_id,
                 slot_reused=self._generation_slot_reused,
                 total_chunks=chunk_num,
@@ -492,8 +505,34 @@ class LlamaCppChunkedLLMService(AIService):
                 tokens_cached=self._generation_tokens_cached,
                 tokens_evaluated=self._generation_tokens_evaluated,
             )
-            logger.debug(f"LlamaCppChunkedLLM: {metrics_frame}")
-            await self.push_frame(metrics_frame)
+            logger.info(f"LlamaCppChunkedLLM: {slot_metrics_frame}")
+            await self.push_frame(slot_metrics_frame)
+
+            # Emit LLM token usage metrics for Pipecat Playground
+            prompt_tokens = self._generation_tokens_cached + self._generation_tokens_evaluated
+            completion_tokens = self._generation_tokens_predicted
+            total_tokens = prompt_tokens + completion_tokens
+            if total_tokens > 0:
+                token_usage = LLMTokenUsage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    cache_read_input_tokens=self._generation_tokens_cached,
+                )
+                usage_metrics_frame = MetricsFrame(
+                    data=[
+                        LLMUsageMetricsData(
+                            processor=self.name,
+                            value=token_usage,
+                        )
+                    ]
+                )
+                logger.info(
+                    f"LlamaCppChunkedLLM: Token usage - "
+                    f"prompt={prompt_tokens}, completion={completion_tokens}, "
+                    f"total={total_tokens}, cached={self._generation_tokens_cached}"
+                )
+                await self.push_frame(usage_metrics_frame)
 
         except Exception as e:
             logger.error(f"LlamaCppChunkedLLM error: {e}")
@@ -607,16 +646,33 @@ class LlamaCppChunkedLLMService(AIService):
                     # Check for EOS/stop token
                     if data.get("stop"):
                         stop_type = data.get("stop_type", "")
+                        # Log stop event to verify cache metric field names
+                        logger.info(f"LlamaCppChunkedLLM: Stop event: {data}")
                         if stop_type in ("eos", "word"):
                             if token_text:
                                 collected_text += token_text
                                 collected_tokens += 1
-                            # Capture cache metrics from the stop event
-                            # llama.cpp includes tokens_cached and tokens_evaluated
-                            if "tokens_cached" in data:
-                                self._generation_tokens_cached += data.get("tokens_cached", 0)
-                            if "tokens_evaluated" in data:
-                                self._generation_tokens_evaluated += data.get("tokens_evaluated", 0)
+                            # Capture token metrics from the stop event
+                            # llama.cpp returns:
+                            #   tokens_predicted = completion tokens generated
+                            #   timings.cache_n = tokens reused from cache (cache HIT)
+                            #   timings.prompt_n = tokens that needed evaluation
+                            tokens_predicted = data.get("tokens_predicted", 0)
+                            self._generation_tokens_predicted += tokens_predicted
+                            timings = data.get("timings", {})
+                            if timings:
+                                cache_hit = timings.get("cache_n", 0)
+                                prompt_eval = timings.get("prompt_n", 0)
+                                self._generation_tokens_cached += cache_hit
+                                self._generation_tokens_evaluated += prompt_eval
+                                logger.info(
+                                    f"LlamaCppChunkedLLM: Chunk cache: "
+                                    f"{cache_hit}/{cache_hit + prompt_eval} tokens from cache "
+                                    f"({100*cache_hit/(cache_hit + prompt_eval) if (cache_hit + prompt_eval) > 0 else 0:.0f}%), "
+                                    f"predicted={tokens_predicted}, "
+                                    f"prompt_ms={timings.get('prompt_ms', 0):.0f}, "
+                                    f"predicted_ms={timings.get('predicted_ms', 0):.0f}"
+                                )
                             hit_eos = True
                             break
 
