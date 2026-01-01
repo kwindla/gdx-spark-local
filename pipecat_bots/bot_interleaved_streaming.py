@@ -49,6 +49,7 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from nvidia_stt import NVidiaWebSocketSTTService
 from magpie_websocket_tts import MagpieWebSocketTTSService
 from llama_cpp_chunked_llm import LlamaCppChunkedLLMService
+from llama_cpp_buffered_llm import LlamaCppBufferedLLMService
 from v2v_metrics import V2VMetricsProcessor
 
 load_dotenv(override=True)
@@ -57,6 +58,9 @@ load_dotenv(override=True)
 NVIDIA_ASR_URL = os.getenv("NVIDIA_ASR_URL", "ws://localhost:8080")
 NVIDIA_LLAMA_CPP_URL = os.getenv("NVIDIA_LLAMA_CPP_URL", "http://localhost:8000")
 NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
+
+# LLM mode: "buffered" (default, single-slot, 100% cache) or "chunked" (two-slot, sentence-cancel)
+LLM_MODE = os.getenv("LLM_MODE", "buffered").lower()
 
 # Audio recording configuration
 ENABLE_RECORDING = os.getenv("ENABLE_RECORDING", "false").lower() == "true"
@@ -120,6 +124,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"  ASR URL: {NVIDIA_ASR_URL}")
     logger.info(f"  LLM URL: {NVIDIA_LLAMA_CPP_URL}")
     logger.info(f"  TTS URL: {NVIDIA_TTS_URL}")
+    logger.info(f"  LLM mode: {LLM_MODE}")
     logger.info(f"  Transport: {type(transport).__name__}")
     logger.info(f"  Recording: {'enabled' if ENABLE_RECORDING else 'disabled'}")
     logger.info(f"  VAD stop_secs: {VAD_STOP_SECS}s")
@@ -144,15 +149,29 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     )
     logger.info("Using WebSocket Magpie TTS (adaptive mode)")
 
-    # Chunked LLM - sentence-boundary streaming direct to llama.cpp
-    llm = LlamaCppChunkedLLMService(
-        llama_url=NVIDIA_LLAMA_CPP_URL,
-        params=LlamaCppChunkedLLMService.InputParams(
-            first_chunk_min_tokens=10,
-            first_chunk_max_tokens=24,
-        ),
-    )
-    logger.info("Using LlamaCppChunkedLLMService (sentence-boundary streaming)")
+    # LLM service - buffered (default) or chunked mode
+    if LLM_MODE == "buffered":
+        # Buffered mode: single slot, 100% KV cache reuse, no mid-stream cancel
+        llm = LlamaCppBufferedLLMService(
+            llama_url=NVIDIA_LLAMA_CPP_URL,
+            params=LlamaCppBufferedLLMService.InputParams(
+                first_segment_max_tokens=24,
+                first_segment_hard_max_tokens=24,
+                segment_max_tokens=32,
+                segment_hard_max_tokens=96,
+            ),
+        )
+        logger.info("Using LlamaCppBufferedLLMService (single-slot, 100% cache)")
+    else:
+        # Chunked mode: two-slot alternation with mid-stream cancel (legacy)
+        llm = LlamaCppChunkedLLMService(
+            llama_url=NVIDIA_LLAMA_CPP_URL,
+            params=LlamaCppChunkedLLMService.InputParams(
+                first_chunk_min_tokens=10,
+                first_chunk_max_tokens=24,
+            ),
+        )
+        logger.info("Using LlamaCppChunkedLLMService (two-slot, sentence-cancel)")
 
     # Voice-to-voice response time metrics
     v2v_metrics = V2VMetricsProcessor(vad_stop_secs=VAD_STOP_SECS)
