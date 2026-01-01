@@ -40,7 +40,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 # Default settings
-LLM_MODE="llamacpp-q8"
 LLAMA_MODEL=""
 VLLM_MODEL=""
 ENABLE_ASR="true"
@@ -52,6 +51,15 @@ DETACH="true"
 DEFAULT_Q8_MODEL="$(find "$HOME/.cache/huggingface/hub/models--unsloth--Nemotron-3-Nano-30B-A3B-GGUF" -name "*Q8*.gguf" 2>/dev/null | head -1)"
 DEFAULT_Q4_MODEL="$(find "$HOME/.cache/huggingface/hub/models--unsloth--Nemotron-3-Nano-30B-A3B-GGUF" -name "*Q4*.gguf" 2>/dev/null | head -1)"
 DEFAULT_VLLM_MODEL="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+
+# Auto-detect LLM mode based on available models (prefer Q8 if available)
+if [[ -n "$DEFAULT_Q8_MODEL" ]]; then
+    LLM_MODE="llamacpp-q8"
+elif [[ -n "$DEFAULT_Q4_MODEL" ]]; then
+    LLM_MODE="llamacpp-q4"
+else
+    LLM_MODE="llamacpp-q8"  # Fallback, will error later if no model found
+fi
 
 # =============================================================================
 # Helper functions

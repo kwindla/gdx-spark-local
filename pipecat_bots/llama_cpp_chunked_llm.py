@@ -76,8 +76,9 @@ DEFAULT_NUM_SLOTS = 2
 
 # Minimum time (seconds) before reusing the same slot
 # This ensures any async cleanup from cancelled requests is complete
-# 1 second is conservative - cleanup completes in milliseconds
-DEFAULT_MIN_SLOT_REUSE_DELAY_S = 1.0
+# and late-arriving TCP close signals don't trigger GGML_ASSERT crashes.
+# 2 seconds provides buffer for network buffering delays.
+DEFAULT_MIN_SLOT_REUSE_DELAY_S = 2.0
 
 
 class ChunkedLLMContinueGenerationFrame(SystemFrame):
