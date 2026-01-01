@@ -59,6 +59,66 @@ User speaks     VAD detects    STT sends     LLM receives    LLM first      TTS 
 
 The ASR server uses NVIDIA's Parakeet model with true incremental streaming. It processes audio in 160ms chunks (16 mel frames) and maintains encoder/decoder cache state across chunks for continuous transcription.
 
+#### Encoder Context Configuration
+
+The Conformer encoder uses attention with configurable left and right context:
+
+```
+att_context_size = [70, 1]  # [left_context, right_context]
+```
+
+| Parameter | Value | Duration | Purpose |
+|-----------|-------|----------|---------|
+| **Left context** | 70 frames | 700ms | Past audio for accuracy (fixed) |
+| **Right context** | 1 frame | 160ms | Future lookahead (configurable) |
+
+The left context of 70 frames is fixed and provides the encoder with substantial history for accurate recognition. The right context controls the latency/accuracy tradeoff and can be changed at runtime without retraining:
+
+| Right Context | Latency | Description |
+|---------------|---------|-------------|
+| 0 | ~80ms | Ultra-low latency, slightly lower accuracy |
+| **1** | **~160ms** | **Low latency (default, recommended)** |
+| 6 | ~560ms | Higher accuracy for noisy environments |
+| 13 | ~1.12s | Maximum accuracy, conversational use only |
+
+Configure via CLI:
+
+```bash
+python -m nemotron_speech.server --right-context 1   # 160ms (default)
+python -m nemotron_speech.server --right-context 0   # 80ms ultra-low
+python -m nemotron_speech.server --right-context 6   # 560ms balanced
+```
+
+#### Streaming Chunk Parameters
+
+These values come from the model's streaming configuration and were tuned for optimal latency:
+
+| Parameter | Value | Duration | Purpose |
+|-----------|-------|----------|---------|
+| `shift_frames` | 16 | 160ms | Inference runs every 16 mel frames |
+| `pre_encode_cache` | 9 | 90ms | Overlap frames for chunk boundary context |
+| `hop_samples` | 160 | 10ms | Samples per mel frame at 16kHz |
+
+The 160ms chunk size balances inference efficiency (larger chunks = better GPU utilization) against latency (smaller chunks = faster interim results).
+
+#### VAD Alignment with ASR Trailing Context
+
+The VAD `stop_secs` parameter is carefully aligned with ASR requirements:
+
+```python
+VAD_STOP_SECS = 0.2  # Fire after 200ms of silence
+```
+
+**Why this matters:** The encoder needs trailing silence to finalize the last word(s). The required padding is:
+
+```
+final_padding = (right_context + 1) * shift_frames * hop_samples
+             = (1 + 1) * 16 * 160
+             = 5120 samples = 320ms
+```
+
+By setting VAD to fire after ~200ms of silence, most of the required trailing context has already been streamed to the server. The server adds the remaining padding on reset, minimizing additional delay for final transcription.
+
 #### Architecture
 
 ```
