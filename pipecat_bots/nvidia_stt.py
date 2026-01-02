@@ -33,8 +33,6 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.utils.time import time_now_iso8601
 
-from frames import LLMCacheWarmFrame
-
 
 class NVidiaWebSocketSTTService(WebsocketSTTService):
     """NVIDIA Parakeet streaming speech-to-text service.
@@ -422,9 +420,6 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
                     language=None,
                 )
             )
-            # Also emit LLMCacheWarmFrame for cache pre-warming.
-            # This frame bypasses the context aggregator and goes directly to the LLM.
-            await self.push_frame(LLMCacheWarmFrame(text=text))
 
     async def start_metrics(self):
         """Start TTFB and processing metrics collection."""
