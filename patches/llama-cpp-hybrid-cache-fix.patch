@@ -1,0 +1,58 @@
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2303,7 +2303,11 @@ struct server_context {
+                         }
+
+                         // [TAG_PROMPT_LOGITS]
+-                        if (n_past == slot.task->n_tokens() && n_past > 0) {
++                        // For n_predict=0 (cache warming), we don't need logits so we can skip
++                        // this "evaluate at least 1 token" logic. This prevents cache thrashing
++                        // on hybrid models (Mamba/Transformer) when consecutive requests have
++                        // identical token counts.
++                        if (n_past == slot.task->n_tokens() && n_past > 0 && slot.task->params.n_predict != 0) {
+                             SLT_WRN(slot, "need to evaluate at least 1 token for each active slot (n_past = %d, task.n_tokens() = %d)\n", n_past, slot.task->n_tokens());
+                             n_past--;
+                             SLT_WRN(slot, "n_past was set to %d\n", n_past);
+@@ -2335,10 +2339,17 @@ struct server_context {
+                     if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1)) {
+                         SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
+
+-                        clear_slot(slot);
+-
+-                        // there is no common part left
++                        // Cannot call clear_slot() here because slot is in STARTED state
++                        // (is_processing() == true). Calling clear_slot() would trigger:
++                        // GGML_ASSERT(!slot.is_processing()) at server-context.cpp:1011
++                        // Instead, clear the memory directly and reset prompt tokens.
++                        if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, -1, -1)) {
++                            SLT_WRN(slot, "failed to clear memory for slot %d\n", slot.id);
++                        }
++                        slot.prompt.tokens.clear();
+                         slot.n_prompt_tokens_cache = 0;
++
++                        // there is no common part left (memory was cleared)
+                     }
+
+                     // check if we should process the image
+@@ -2434,6 +2445,21 @@ struct server_context {
+                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
+                         slot.state = SLOT_STATE_DONE_PROMPT;
+
++                        // For n_predict=0 (cache warming) with all tokens cached,
++                        // batch.n_tokens will be 0. We can't extract logits from an empty
++                        // batch, so skip directly to GENERATING state. The generation
++                        // phase will see n_decoded(0) >= n_predict(0) and complete
++                        // immediately, sending the HTTP response.
++                        if (batch.n_tokens == 0 && slot.task->params.n_predict == 0) {
++                            SLT_INF(slot, "cache warming complete (all cached), skipping to generation%s\n", "");
++                            slot.n_decoded = 0;
++                            slot.i_batch = -1;  // No batch position
++                            // Set state to GENERATING so we skip DONE_PROMPT processing
++                            // and go directly to generation completion check
++                            slot.state = SLOT_STATE_GENERATING;
++                            continue;
++                        }
++
+                         GGML_ASSERT(batch.n_tokens > 0);
+
+                         common_sampler_reset(slot.smpl.get());

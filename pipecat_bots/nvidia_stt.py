@@ -33,6 +33,8 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.stt_service import WebsocketSTTService
 from pipecat.utils.time import time_now_iso8601
 
+from frames import LLMCacheWarmFrame
+
 
 class NVidiaWebSocketSTTService(WebsocketSTTService):
     """NVIDIA Parakeet streaming speech-to-text service.
@@ -175,7 +177,7 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
                 self._pending_user_stopped_frame = frame
                 self._pending_frame_direction = direction
                 self._start_pending_frame_timeout()
-                logger.debug(f"{self} holding UserStoppedSpeakingFrame until final transcript")
+                logger.debug(f"{self} holding UserStoppedSpeakingFrame at {time.time():.3f}")
                 return  # Don't pass through yet
             # If not waiting for final, pass through normally
             await super().process_frame(frame, direction)
@@ -261,7 +263,7 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
 
         if self._pending_user_stopped_frame:
             await self._cancel_pending_frame_timeout()
-            logger.debug(f"{self} releasing UserStoppedSpeakingFrame after final transcript")
+            logger.debug(f"{self} releasing UserStoppedSpeakingFrame at {time.time():.3f}")
             await self.push_frame(
                 self._pending_user_stopped_frame,
                 self._pending_frame_direction
@@ -381,7 +383,7 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         timestamp = time_now_iso8601()
 
         if is_final:
-            logger.debug(f"{self} final transcript: {text[:50]}...")
+            logger.debug(f"{self} final transcript at {time.time():.3f}: {text[:50]}...")
             # Push transcript first
             await self.push_frame(
                 TranscriptionFrame(
@@ -420,6 +422,9 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
                     language=None,
                 )
             )
+            # Also emit LLMCacheWarmFrame for cache pre-warming.
+            # This frame bypasses the context aggregator and goes directly to the LLM.
+            await self.push_frame(LLMCacheWarmFrame(text=text))
 
     async def start_metrics(self):
         """Start TTFB and processing metrics collection."""

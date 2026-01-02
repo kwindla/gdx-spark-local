@@ -63,6 +63,7 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "ruff>=0.1.0",
     "mypy>=1.8.0",
+    "aiortc>=1.14.0",
 ]
 
 [tool.ruff]

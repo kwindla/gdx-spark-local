@@ -1,0 +1,19 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 1234567..abcdefg 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -2334,7 +2334,12 @@ class server_context {
+                     if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1)) {
+                         SLT_WRN(slot, "failed to truncate tokens with position >= %d - clearing the memory\n", p0);
+
+-                        clear_slot(slot);
++                        // Cannot call clear_slot() here because slot is processing.
++                        // Instead, clear the memory directly and reset prompt tokens.
++                        // Use full range (-1, -1) to clear all memory for this slot.
++                        if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, -1, -1)) {
++                            SLT_WRN(slot, "failed to clear memory for slot %d\n", slot.id);
++                        }
++                        slot.prompt.tokens.clear();
+
+                         // there is no common part left
+                         slot.n_prompt_tokens_cache = 0;
