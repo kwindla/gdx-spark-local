@@ -10,7 +10,7 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
-import websockets
+from aiohttp import web, WSMsgType
 from loguru import logger
 
 # Enable debug logging with DEBUG_ASR=1
@@ -83,6 +83,9 @@ class ASRServer:
 
         # Active sessions
         self.sessions: dict[str, ASRSession] = {}
+
+        # Model loaded flag for health check
+        self.model_loaded = False
 
         # Streaming parameters (calculated from model config)
         self.shift_frames = None
@@ -220,12 +223,15 @@ class ASRServer:
         session.pred_out_stream = None
         session.current_text = ""
 
-    async def handle_client(self, websocket):
+    async def websocket_handler(self, request: web.Request) -> web.WebSocketResponse:
         """Handle a WebSocket client connection."""
         import uuid
 
+        ws = web.WebSocketResponse(max_msg_size=10 * 1024 * 1024)
+        await ws.prepare(request)
+
         session_id = str(uuid.uuid4())[:8]
-        session = ASRSession(id=session_id, websocket=websocket)
+        session = ASRSession(id=session_id, websocket=ws)
         self.sessions[session_id] = session
 
         logger.info(f"Client {session_id} connected")
@@ -236,15 +242,15 @@ class ASRServer:
                     None, self._init_session, session
                 )
 
-            await websocket.send(json.dumps({"type": "ready"}))
+            await ws.send_str(json.dumps({"type": "ready"}))
             logger.debug(f"Client {session_id}: sent ready")
 
-            async for message in websocket:
-                if isinstance(message, bytes):
-                    await self._handle_audio(session, message)
-                else:
+            async for msg in ws:
+                if msg.type == WSMsgType.BINARY:
+                    await self._handle_audio(session, msg.data)
+                elif msg.type == WSMsgType.TEXT:
                     try:
-                        data = json.loads(message)
+                        data = json.loads(msg.data)
                         msg_type = data.get("type")
 
                         if msg_type == "reset" or msg_type == "end":
@@ -254,22 +260,28 @@ class ASRServer:
 
                     except json.JSONDecodeError:
                         logger.warning(f"Client {session_id}: invalid JSON")
+                elif msg.type == WSMsgType.ERROR:
+                    logger.error(f"Client {session_id} WebSocket error: {ws.exception()}")
+                    break
 
-        except websockets.exceptions.ConnectionClosed:
             logger.info(f"Client {session_id} disconnected")
+
         except Exception as e:
             logger.error(f"Client {session_id} error: {e}")
             import traceback
             logger.error(traceback.format_exc())
             try:
-                await websocket.send(json.dumps({
+                await ws.send_str(json.dumps({
                     "type": "error",
                     "message": str(e)
                 }))
             except:
                 pass
         finally:
-            del self.sessions[session_id]
+            if session_id in self.sessions:
+                del self.sessions[session_id]
+
+        return ws
 
     async def _handle_audio(self, session: ASRSession, audio_bytes: bytes):
         """Accumulate audio and process when enough frames available."""
@@ -294,7 +306,7 @@ class ASRServer:
             if text is not None and text != session.current_text:
                 session.current_text = text
                 logger.debug(f"Session {session.id} interim: {text[-50:] if len(text) > 50 else text}")
-                await session.websocket.send(json.dumps({
+                await session.websocket.send_str(json.dumps({
                     "type": "transcript",
                     "text": text,
                     "is_final": False
@@ -420,7 +432,7 @@ class ASRServer:
             logger.debug(f"Session {session.id} final chunk processed in {elapsed_ms:.1f}ms")
 
         # Send final transcript
-        await session.websocket.send(json.dumps({
+        await session.websocket.send_str(json.dumps({
             "type": "transcript",
             "text": session.current_text,
             "is_final": True
@@ -518,20 +530,32 @@ class ASRServer:
             logger.error(traceback.format_exc())
             return None
 
+    async def health_handler(self, request: web.Request) -> web.Response:
+        """Health check endpoint."""
+        return web.json_response({
+            "status": "healthy" if self.model_loaded else "loading",
+            "model_loaded": self.model_loaded,
+        })
+
     async def start(self):
-        """Start the WebSocket server."""
+        """Start the HTTP + WebSocket server."""
         self.load_model()
+        self.model_loaded = True
 
         logger.info(f"Starting streaming ASR server on ws://{self.host}:{self.port}")
 
-        async with websockets.serve(
-            self.handle_client,
-            self.host,
-            self.port,
-            max_size=10 * 1024 * 1024,
-        ):
-            logger.info(f"ASR server listening on ws://{self.host}:{self.port}")
-            await asyncio.Future()
+        app = web.Application()
+        app.router.add_get("/health", self.health_handler)
+        app.router.add_get("/", self.websocket_handler)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, self.host, self.port)
+        await site.start()
+
+        logger.info(f"ASR server listening on ws://{self.host}:{self.port}")
+        logger.info(f"Health check available at http://{self.host}:{self.port}/health")
+        await asyncio.Future()  # Run forever
 
 
 def main():

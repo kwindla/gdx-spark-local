@@ -22,6 +22,7 @@ classifiers = [
 dependencies = [
     "gdown>=5.0.0",
     "websockets>=12.0",
+    "aiohttp>=3.9.0",
     "numpy>=1.26.0",
     "loguru>=0.7.0",
     # Pipecat bot dependencies
