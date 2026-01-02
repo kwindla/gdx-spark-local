@@ -33,7 +33,7 @@ from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import Frame, LLMMessagesFrame, LLMRunFrame, InterimTranscriptionFrame
+from pipecat.frames.frames import Frame, LLMMessagesFrame, LLMRunFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -53,27 +53,6 @@ from nvidia_stt import NVidiaWebSocketSTTService
 from magpie_websocket_tts import MagpieWebSocketTTSService
 from llama_cpp_buffered_llm import LlamaCppBufferedLLMService
 from v2v_metrics import V2VMetricsProcessor
-from frames import LLMCacheWarmFrame
-
-
-class InterimToCacheWarmProcessor(FrameProcessor):
-    """Converts InterimTranscriptionFrame to LLMCacheWarmFrame for cache pre-warming.
-
-    Placed before the context aggregator to intercept interim transcriptions
-    (which the aggregator consumes) and forward them as cache warm requests
-    to the LLM service downstream.
-    """
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection):
-        await super().process_frame(frame, direction)
-
-        if isinstance(frame, InterimTranscriptionFrame):
-            # Convert to cache warm frame and push downstream
-            cache_warm = LLMCacheWarmFrame(text=frame.text)
-            await self.push_frame(cache_warm, direction)
-
-        # Always pass through the original frame
-        await self.push_frame(frame, direction)
 
 
 class ContextTimingWrapper(FrameProcessor):
@@ -226,10 +205,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     context_aggregator = LLMContextAggregatorPair(context)
 
     # LLM service - buffered mode (single slot, 100% KV cache reuse)
-    # Pass context_aggregator.assistant() for cache warming to access full conversation history
     llm = LlamaCppBufferedLLMService(
         llama_url=NVIDIA_LLAMA_CPP_URL,
-        context_aggregator=context_aggregator.assistant(),
         params=LlamaCppBufferedLLMService.InputParams(
             first_segment_max_tokens=24,
             first_segment_hard_max_tokens=24,
@@ -242,10 +219,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     # RTVI processor for client communication
     rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
 
-    # Processor to convert interim transcriptions to cache warm requests
-    # Must be before context_aggregator.user() which consumes InterimTranscriptionFrame
-    interim_to_cache_warm = InterimToCacheWarmProcessor()
-
     # Context timing wrapper for V2V latency investigation
     context_timing = ContextTimingWrapper()
 
@@ -254,7 +227,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         transport.input(),
         rtvi,
         stt,
-        interim_to_cache_warm,  # Convert interim → cache warm frame before aggregator
         context_aggregator.user(),
         context_timing,  # Log when LLMMessagesFrame passes through
         llm,

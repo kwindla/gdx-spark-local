@@ -3,8 +3,6 @@
 Extracted to a shared module to avoid circular imports between LLM and TTS services.
 """
 
-from dataclasses import dataclass
-
 from pipecat.frames.frames import SystemFrame
 
 
@@ -19,18 +17,3 @@ class ChunkedLLMContinueGenerationFrame(SystemFrame):
     """
 
     pass
-
-
-@dataclass
-class LLMCacheWarmFrame(SystemFrame):
-    """Request to pre-warm the LLM's KV cache with partial user text.
-
-    Sent when interim transcription is available. The LLM can use this
-    to send a n_predict=0 request to populate the cache, so when the
-    final transcription arrives, more tokens are already cached.
-
-    Attributes:
-        text: The interim/partial user transcription text.
-    """
-
-    text: str

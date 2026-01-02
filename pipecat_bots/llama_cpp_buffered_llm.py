@@ -4,7 +4,6 @@ Connects directly to llama.cpp's HTTP API with a buffered approach that:
 1. Runs LLM generations to completion (no mid-stream cancellation)
 2. Uses a SentenceBuffer to extract text at sentence boundaries
 3. Achieves ~100% KV cache reuse via single-slot operation
-4. Optionally pre-warms cache on STT interim transcriptions
 
 Architecture:
     ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -33,12 +32,8 @@ Usage:
 
 import asyncio
 import json
-import os
 import time
-from typing import Optional, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from pipecat.processors.aggregators.llm_response_universal import LLMAssistantAggregator
+from typing import Optional
 
 import httpx
 from loguru import logger
@@ -63,7 +58,6 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.ai_service import AIService
 
 from sentence_buffer import SentenceBuffer
-from frames import LLMCacheWarmFrame
 
 # Import context frame types (handle different Pipecat versions)
 try:
@@ -177,7 +171,6 @@ class LlamaCppBufferedLLMService(AIService):
         *,
         llama_url: str = "http://localhost:8000",
         params: Optional[InputParams] = None,
-        context_aggregator: Optional["LLMAssistantAggregator"] = None,
         **kwargs,
     ):
         """Initialize LlamaCppBufferedLLMService.
@@ -185,14 +178,8 @@ class LlamaCppBufferedLLMService(AIService):
         Args:
             llama_url: Base URL for llama.cpp server (e.g., "http://localhost:8000")
             params: Configuration parameters
-            context_aggregator: Optional assistant aggregator for cache warming context.
-                If provided, cache warming will use the aggregator's context which
-                includes the complete conversation history with assistant responses.
         """
         super().__init__(**kwargs)
-
-        # Store aggregator reference for cache warming context
-        self._context_aggregator = context_aggregator
 
         self._params = params or self.InputParams()
         self._llama_url = llama_url.rstrip("/")
@@ -225,29 +212,13 @@ class LlamaCppBufferedLLMService(AIService):
 
         self.set_model_name("llama-cpp-buffered")
 
-        # Cache warming configuration (from environment)
-        self._enable_cache_warming = os.getenv("ENABLE_CACHE_WARMING", "true").lower() == "true"
-        self._cache_warming_min_chars = int(os.getenv("CACHE_WARMING_MIN_CHARS", "10"))
-
-        # Cache warming state - queue-based approach:
-        # - At most one warmup in-flight at a time
-        # - At most one pending warmup queued
-        # - Wait for in-flight warmup before inference
-        self._warmup_task: Optional[asyncio.Task] = None  # Currently executing warmup chain
-        self._pending_warmup_text: Optional[str] = None  # Next text to warm (only one)
-        self._pending_warmup_context: Optional[list] = None  # Context for pending warmup
-        self._last_context: Optional[LLMContext] = None  # For cache warming
-        self._last_warmed_text: str = ""  # Track last warmed text to avoid duplicates
-
         logger.info(
             f"LlamaCppBufferedLLMService initialized: url={self._llama_url}, "
             f"slot={self._params.slot_id}, "
             f"first_segment=({self._params.first_segment_max_tokens}, "
             f"{self._params.first_segment_hard_max_tokens}), "
             f"segment=({self._params.segment_max_tokens}, "
-            f"{self._params.segment_hard_max_tokens}), "
-            f"cache_warming={self._enable_cache_warming}, "
-            f"min_chars={self._cache_warming_min_chars}"
+            f"{self._params.segment_hard_max_tokens})"
         )
 
     def can_generate_metrics(self) -> bool:
@@ -324,11 +295,6 @@ class LlamaCppBufferedLLMService(AIService):
                 self._continue_event.set()
             return  # Don't propagate
 
-        # Handle cache warming request (from interim transcription)
-        if isinstance(frame, LLMCacheWarmFrame):
-            await self._handle_cache_warm(frame)
-            return  # Don't propagate - it's an internal signal
-
         # Handle context frames
         if LLMContextFrame and isinstance(frame, LLMContextFrame):
             context = frame.context
@@ -341,7 +307,6 @@ class LlamaCppBufferedLLMService(AIService):
             await self.push_frame(frame, direction)
 
         if context:
-            self._last_context = context  # Store for cache warming
             await self._process_context(context)
 
     async def _handle_interruption(self, frame: InterruptionFrame):
@@ -356,13 +321,6 @@ class LlamaCppBufferedLLMService(AIService):
         # Reset state
         self._cancelled = True
         self._generating = False
-
-        # Clear pending warmup and cancel in-flight warmup on interruption
-        self._pending_warmup_text = None
-        self._pending_warmup_context = None
-        if self._warmup_task and not self._warmup_task.done():
-            self._warmup_task.cancel()
-            self._warmup_task = None
 
         # Signal any waiting coroutines
         if self._continue_event:
@@ -437,14 +395,6 @@ class LlamaCppBufferedLLMService(AIService):
                 timeout=300.0,
                 limits=httpx.Limits(max_keepalive_connections=0),
             )
-
-        # Wait for any in-flight cache warming to complete before starting generation
-        # This prevents llama.cpp race condition with slot handling
-        t0 = time.time()
-        await self._wait_for_cache_warming()
-        cache_wait_ms = (time.time() - t0) * 1000
-        if cache_wait_ms > 1:
-            logger.debug(f"LLM: Cache warming wait took {cache_wait_ms:.0f}ms")
 
         # Cancel any existing generation and wait for it to exit
         if self._generating:
@@ -739,164 +689,3 @@ class LlamaCppBufferedLLMService(AIService):
         self._generated_text += collected_text
 
         return collected_text, tokens_generated, hit_eos
-
-    async def _handle_cache_warm(self, frame: LLMCacheWarmFrame):
-        """Handle cache warming request from interim transcription.
-
-        Queue-based approach:
-        - If no warmup in progress: start warmup chain
-        - If warmup in progress: queue this text (replacing any pending)
-
-        This ensures sequential access to llama.cpp slot without debounce delays.
-
-        Uses context_aggregator.context if available (has complete history including
-        assistant responses), otherwise falls back to _last_context.
-        """
-        if not self._enable_cache_warming:
-            return
-
-        # Get context from aggregator (preferred - has complete history) or fallback
-        if self._context_aggregator:
-            context_messages = list(self._context_aggregator.context.get_messages())
-        elif self._last_context:
-            context_messages = list(self._last_context.get_messages())
-        else:
-            return  # No context available
-
-        text = frame.text.strip()
-
-        # Skip if too short
-        if len(text) < self._cache_warming_min_chars:
-            return
-
-        # Skip if text is identical to or contained in what was just warmed
-        # This prevents llama.cpp crash from identical token counts
-        if text == self._last_warmed_text:
-            logger.debug(f"Cache warm: skipping duplicate '{text[:30]}...'")
-            return
-        if self._last_warmed_text and text in self._last_warmed_text:
-            logger.debug(f"Cache warm: skipping subset of previous '{text[:30]}...'")
-            return
-
-        # Context is already captured above - use it for warmup
-
-        # Queue-based approach: at most one in-flight, at most one pending
-        if self._warmup_task is None or self._warmup_task.done():
-            # No warmup in progress - start warmup chain
-            logger.debug(f"Cache warm: starting chain for '{text[:30]}...'")
-            self._warmup_task = asyncio.create_task(
-                self._run_warmup_chain(text, context_messages)
-            )
-        else:
-            # Warmup in progress - queue this text with context snapshot
-            logger.debug(f"Cache warm: queuing '{text[:30]}...' (warmup in progress)")
-            self._pending_warmup_text = text
-            self._pending_warmup_context = context_messages
-
-    async def _run_warmup_chain(self, initial_text: str, context_messages: list):
-        """Run warmup requests sequentially until no pending.
-
-        This chain processes the initial text, then any pending text that
-        was queued while the initial request was in-flight. This ensures
-        we always warm with the latest interim transcription.
-
-        Args:
-            initial_text: First interim text to warm
-            context_messages: Snapshot of context messages at scheduling time
-        """
-        text = initial_text
-        ctx = context_messages
-        while text:
-            await self._do_warmup_request(text, ctx)
-            # Check for pending (set while we were warming)
-            text = self._pending_warmup_text
-            ctx = self._pending_warmup_context or ctx  # Use new context if provided
-            self._pending_warmup_text = None
-            self._pending_warmup_context = None
-
-    async def _do_warmup_request(self, interim_text: str, context_messages: list):
-        """Send n_predict=0 request to pre-warm KV cache.
-
-        This populates the KV cache with the system prompt + history + interim
-        user text, so when the final transcription arrives most tokens are cached.
-
-        Args:
-            interim_text: The interim transcription text to warm
-            context_messages: Snapshot of context messages (captured at scheduling time)
-        """
-        if not self._client:
-            return
-
-        try:
-            # Build prompt with interim user text appended to the CAPTURED context
-            # (not self._last_context which may have been updated since)
-            messages_with_interim = context_messages + [{"role": "user", "content": interim_text}]
-            warm_prompt = self._format_messages(messages_with_interim)
-
-            payload = {
-                "prompt": warm_prompt,
-                "n_predict": 0,
-                "id_slot": self._params.slot_id,
-                "cache_prompt": True,
-                "stream": False,  # Non-streaming for clean completion
-            }
-
-            start = time.time()
-            response = await self._client.post(
-                f"{self._llama_url}/completion", json=payload
-            )
-            elapsed_ms = (time.time() - start) * 1000
-
-            if response.status_code == 200:
-                data = response.json()
-                timings = data.get("timings", {})
-                cached = timings.get("cache_n", 0)  # Tokens from cache
-                evaled = timings.get("prompt_n", 0)  # Tokens evaluated
-                logger.info(
-                    f"Cache warm: '{interim_text[:30]}...' -> "
-                    f"{elapsed_ms:.0f}ms, {cached} cached, {evaled} eval"
-                )
-                # Track what we just warmed to avoid duplicate requests
-                self._last_warmed_text = interim_text
-            else:
-                logger.warning(f"Cache warming failed: status {response.status_code}")
-
-        except asyncio.CancelledError:
-            logger.debug(f"Cache warming cancelled for '{interim_text[:20]}...'")
-            raise  # Re-raise to stop the chain
-        except Exception as e:
-            logger.debug(f"Cache warming error: {e}")
-
-    async def _wait_for_cache_warming(self):
-        """Wait for any in-flight cache warming to complete.
-
-        Called before generation starts to ensure sequential slot access.
-        This is critical: we must not send inference request until warmup completes.
-
-        Uses a timeout to prevent hangs when llama.cpp doesn't return a response
-        (e.g., n_predict=0 with all tokens cached on some server versions).
-        """
-        # Clear any pending warmup - we're about to run the real inference
-        self._pending_warmup_text = None
-        self._pending_warmup_context = None
-        # Reset last warmed text for next turn
-        self._last_warmed_text = ""
-
-        if self._warmup_task and not self._warmup_task.done():
-            logger.debug("Waiting for in-flight cache warming to complete...")
-            try:
-                # Wait with timeout - warmup should complete quickly
-                # If it hangs (e.g., server bug), cancel and proceed
-                await asyncio.wait_for(self._warmup_task, timeout=0.5)
-                logger.debug("Cache warming completed, proceeding with inference")
-            except asyncio.TimeoutError:
-                logger.warning("Cache warming timed out after 500ms, cancelling and proceeding")
-                self._warmup_task.cancel()
-                try:
-                    await self._warmup_task
-                except asyncio.CancelledError:
-                    pass
-            except asyncio.CancelledError:
-                logger.debug("Cache warming was cancelled")
-            except Exception as e:
-                logger.debug(f"Cache warming finished with error: {e}")
