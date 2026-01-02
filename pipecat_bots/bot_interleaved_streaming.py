@@ -2,7 +2,8 @@
 #
 # Pipecat bot with interleaved streaming for lowest latency.
 #
-# Uses chunked LLM (sentence-boundary streaming) with adaptive WebSocket TTS.
+# Uses buffered LLM (sentence-boundary streaming) with adaptive WebSocket TTS.
+# Single-slot operation achieves 100% KV cache reuse across turns.
 # SmartTurn analyzer for responsive turn-taking.
 #
 # Environment variables:
@@ -19,6 +20,7 @@
 
 import asyncio
 import os
+import time
 import wave
 from datetime import datetime
 from io import BytesIO
@@ -31,7 +33,8 @@ from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import LLMRunFrame
+from pipecat.frames.frames import Frame, LLMMessagesFrame, LLMRunFrame
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -48,8 +51,21 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 # Import our custom local services
 from nvidia_stt import NVidiaWebSocketSTTService
 from magpie_websocket_tts import MagpieWebSocketTTSService
-from llama_cpp_chunked_llm import LlamaCppChunkedLLMService
+from llama_cpp_buffered_llm import LlamaCppBufferedLLMService
 from v2v_metrics import V2VMetricsProcessor
+
+
+class ContextTimingWrapper(FrameProcessor):
+    """Log when LLMMessagesFrame passes through for V2V timing investigation."""
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, LLMMessagesFrame):
+            logger.debug(f"ContextTiming: LLMMessagesFrame at {time.time():.3f}")
+
+        await self.push_frame(frame, direction)
+
 
 load_dotenv(override=True)
 
@@ -144,16 +160,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     )
     logger.info("Using WebSocket Magpie TTS (adaptive mode)")
 
-    # Chunked LLM - sentence-boundary streaming direct to llama.cpp
-    llm = LlamaCppChunkedLLMService(
-        llama_url=NVIDIA_LLAMA_CPP_URL,
-        params=LlamaCppChunkedLLMService.InputParams(
-            first_chunk_min_tokens=10,
-            first_chunk_max_tokens=24,
-        ),
-    )
-    logger.info("Using LlamaCppChunkedLLMService (sentence-boundary streaming)")
-
     # Voice-to-voice response time metrics
     v2v_metrics = V2VMetricsProcessor(vad_stop_secs=VAD_STOP_SECS)
 
@@ -198,8 +204,23 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     context = LLMContext(messages)
     context_aggregator = LLMContextAggregatorPair(context)
 
+    # LLM service - buffered mode (single slot, 100% KV cache reuse)
+    llm = LlamaCppBufferedLLMService(
+        llama_url=NVIDIA_LLAMA_CPP_URL,
+        params=LlamaCppBufferedLLMService.InputParams(
+            first_segment_max_tokens=24,
+            first_segment_hard_max_tokens=24,
+            segment_max_tokens=32,
+            segment_hard_max_tokens=96,
+        ),
+    )
+    logger.info("Using LlamaCppBufferedLLMService (single-slot, 100% cache)")
+
     # RTVI processor for client communication
     rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
+
+    # Context timing wrapper for V2V latency investigation
+    context_timing = ContextTimingWrapper()
 
     # Build pipeline processors
     pipeline_processors = [
@@ -207,6 +228,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         rtvi,
         stt,
         context_aggregator.user(),
+        context_timing,  # Log when LLMMessagesFrame passes through
         llm,
         tts,
         v2v_metrics,

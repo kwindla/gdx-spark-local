@@ -8,8 +8,10 @@ This document explains in detail how the STT, LLM, and TTS components work toget
 |------|-------------|
 | **Client-side (Pipecat)** | |
 | `pipecat_bots/nvidia_stt.py` | WebSocket STT client that streams audio to Parakeet ASR and receives transcriptions |
-| `pipecat_bots/llama_cpp_chunked_llm.py` | Direct HTTP client to llama.cpp with sentence-boundary chunking and TTS synchronization |
-| `pipecat_bots/magpie_websocket_tts.py` | WebSocket TTS client with adaptive streaming/batch mode selection |
+| `pipecat_bots/llama_cpp_buffered_llm.py` | Buffered HTTP client to llama.cpp with single-slot operation for 100% KV cache reuse |
+| `pipecat_bots/sentence_buffer.py` | Sentence boundary detection and text accumulation for buffered LLM output |
+| `pipecat_bots/magpie_websocket_tts.py` | WebSocket TTS client with adaptive streaming/batch mode and sentence splitting |
+| `pipecat_bots/frames.py` | Shared frame types (ChunkedLLMContinueGenerationFrame) to avoid circular imports |
 | `pipecat_bots/v2v_metrics.py` | Measures voice-to-voice response time (VADUserStoppedSpeaking → BotStartedSpeaking) |
 | `pipecat_bots/bot_interleaved_streaming.py` | Main bot that assembles the pipeline with all services |
 | **Server-side (Inference)** | |
@@ -28,9 +30,9 @@ The key to low voice-to-voice latency is **pipelining** - starting each stage as
 
 The STT service streams audio continuously to the ASR server. When the user stops speaking (detected by VAD after ~200ms of silence), a reset signal triggers final transcription. A critical frame ordering fix ensures the `TranscriptionFrame` arrives at the aggregator *before* `UserStoppedSpeakingFrame`, preventing a 500ms aggregation timeout.
 
-### 2. Chunked LLM with Sentence Boundaries
+### 2. Buffered LLM with Sentence Boundaries
 
-Instead of waiting for the complete LLM response, the chunked LLM service emits text at **sentence boundaries**. The first chunk has aggressive token bounds (10-24 tokens) for fast time-to-first-chunk, while subsequent chunks wait for natural sentence endings. This enables TTS to start speaking the first sentence while the LLM is still generating.
+Instead of waiting for the complete LLM response, the buffered LLM service emits text at **sentence boundaries**. The first segment uses a 24-token limit for fast time-to-first-chunk, while subsequent segments accumulate up to 96 tokens waiting for natural sentence endings. Single-slot operation achieves **100% KV cache reuse** across turns, eliminating context re-evaluation. This enables TTS to start speaking the first sentence while the LLM is still generating.
 
 ### 3. Adaptive TTS with Streaming First Segment
 
@@ -40,11 +42,11 @@ The TTS service uses **adaptive mode**: the first segment uses streaming mode (~
 
 ```
 User speaks     VAD detects    STT sends     LLM receives    LLM first      TTS first
-  "Hello"       silence        final text    transcript      chunk ready    audio out
+  "Hello"       silence        final text    transcript     segment ready   audio out
     │              │               │              │              │              │
     ├──────────────┤───────────────┤──────────────┤──────────────┤──────────────┤
     │   ~speech    │   ~200ms      │   ~30-50ms   │   ~0ms       │  ~100-150ms  │  ~370ms
-    │   duration   │   VAD delay   │   STT proc   │              │  LLM TTFB    │  TTS TTFB
+    │   duration   │   VAD delay   │   STT proc   │  (cached)    │  LLM TTFB    │  TTS TTFB
     │              │               │              │              │              │
     └──────────────┴───────────────┴──────────────┴──────────────┴──────────────┘
                                                                         │
@@ -231,122 +233,175 @@ Audio Stream                    VAD            STT Service              Aggregat
 
 ---
 
-## LLM Service: Chunked Sentence-Boundary Streaming
+## LLM Service: Buffered Sentence-Boundary Streaming
 
 ### Server-Side: llama.cpp
 
 The LLM uses llama.cpp's HTTP API directly (no custom server). Key features used:
 
 - **SSE Streaming**: `/completion` endpoint with `stream: true`
-- **KV Cache**: `cache_prompt: true` + `id_slot` pinning for cache reuse across turns
+- **KV Cache**: `cache_prompt: true` + `id_slot` pinning for 100% cache reuse
+- **Single Slot**: `--parallel 1` for maximum cache efficiency (no slot contention)
 - **Stop Tokens**: `<|im_end|>` for ChatML format
 
-### Client-Side Implementation (`pipecat_bots/llama_cpp_chunked_llm.py`)
+### Client-Side Implementation (`pipecat_bots/llama_cpp_buffered_llm.py`)
 
-The chunked LLM service generates text in **sentence-boundary chunks** rather than token-by-token, enabling TTS to process natural units of speech.
+The buffered LLM service uses a **run-to-completion** approach that achieves 100% KV cache reuse across conversation turns. Unlike the previous chunked approach that cancelled mid-stream, this service lets each generation complete fully, accumulates output in a `SentenceBuffer`, and emits text at natural sentence boundaries.
 
 #### Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                     LlamaCppChunkedLLMService                               │
+│                      LlamaCppBufferedLLMService                             │
 │                                                                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌────────────┐ │
-│  │ LLMContext   │───►│ ChatML       │───►│ HTTP Stream  │───►│ Sentence   │ │
-│  │ Frame        │    │ Formatter    │    │ to llama.cpp │    │ Boundary   │ │
-│  └──────────────┘    └──────────────┘    └──────────────┘    │ Detection  │ │
-│                                                              └────────────┘ │
-│                                                                     │       │
-│                                                                     ▼       │
-│  ┌──────────────┐    ┌──────────────┐                        ┌────────────┐ │
-│  │ Continue     │◄───│ TTS Sync     │◄───────────────────────│ LLMText    │ │
-│  │ Generation   │    │ Event        │                        │ Frame      │ │
-│  └──────────────┘    └──────────────┘                        └────────────┘ │
+│  ┌────────────────┐      ┌─────────────────┐      ┌───────────────────┐    │
+│  │  LLM Generator │      │  SentenceBuffer │      │   TTS Emitter     │    │
+│  │                │      │                 │      │                   │    │
+│  │  - Single slot │─────►│  - Accumulates  │─────►│  - Emits complete │    │
+│  │  - max_tokens  │      │  - Extracts at  │      │    sentences      │    │
+│  │  - Runs to     │      │    boundaries   │      │  - Waits for      │    │
+│  │    completion  │      │  - Keeps tail   │      │    continue       │    │
+│  └────────────────┘      └─────────────────┘      └───────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### First Chunk Optimization
+#### Key Benefits vs Previous Chunked Approach
 
-The first chunk uses aggressive token bounds for fast TTFB:
+| Aspect | Old (Chunked) | New (Buffered) |
+|--------|---------------|----------------|
+| Slots | 2 (alternating) | 1 (single) |
+| GPU Memory | Higher (`--parallel 2`) | Lower (`--parallel 1`) |
+| KV Cache Reuse | ~80-90% | **100%** |
+| Mid-stream Cancel | Yes (race condition risk) | No (runs to completion) |
+| GGML_ASSERT Crashes | Possible | Eliminated |
 
-```python
-if self._is_first_chunk:
-    min_tokens = 10   # Don't emit too-short first chunk
-    max_tokens = 24   # Cap length for fast TTFB
-else:
-    min_tokens = None  # Pure sentence boundary detection
-    max_tokens = None
-```
+#### First Segment Optimization
 
-#### Sentence Boundary Detection with Token Peeking
-
-The service doesn't just check for `.!?` - it peeks at the next token to handle edge cases like closing quotes:
+The first segment uses tight token bounds for fast TTFB:
 
 ```python
-def ends_at_sentence_boundary(text: str) -> bool:
-    """Matches: .!? optionally followed by closing quotes/parens"""
-    return bool(re.search(r'[.!?]["\'\)]*$', text.rstrip()))
+# First segment: quick TTFB, single generation then emit
+first_segment_max_tokens: int = 24
+first_segment_hard_max_tokens: int = 24
+
+# Subsequent segments: allow accumulation for complete sentences
+segment_max_tokens: int = 32
+segment_hard_max_tokens: int = 96
 ```
 
-When a sentence boundary is detected, the service peeks at the next token:
-- If it's part of the sentence ending (e.g., closing quote), include it
-- If it starts the next sentence, save it as `_pending_token` for the next chunk
+#### Sentence Buffer (`pipecat_bots/sentence_buffer.py`)
+
+The `SentenceBuffer` class accumulates LLM output and extracts text at natural boundaries:
+
+```python
+class SentenceBuffer:
+    def extract_complete_sentences(self) -> Optional[str]:
+        """Extract all complete sentences, keep incomplete tail.
+
+        Finds the LAST sentence boundary (.!? followed by space) and returns
+        all text up to and including that boundary.
+        """
+        pattern = r'[.!?]["\'\)]*\s'
+        matches = list(re.finditer(pattern, self.text))
+        if not matches:
+            return None
+
+        last_match = matches[-1]
+        boundary = last_match.end()
+        sentences = self.text[:boundary].lstrip()
+        self.text = self.text[boundary:]  # Keep incomplete tail
+        return sentences if sentences else None
+
+    def extract_at_boundary(self) -> str:
+        """Force extraction at best boundary when hitting token limit.
+
+        Priority: sentence > clause (, ;) > word > everything
+        """
+```
+
+#### Generation Loop
+
+The service runs a simple loop: generate → buffer → check → emit:
+
+```python
+while not self._cancelled:
+    # Step 1: Generate tokens (runs to completion)
+    new_text, new_tokens, hit_eos = await self._generate(max_tokens)
+    self._buffer.add(new_text, new_tokens)
+
+    # Step 2: Check buffer and decide action
+    sentences = self._buffer.extract_complete_sentences()
+    if sentences:
+        await self._emit_and_wait(sentences)  # Emit and wait for TTS
+        continue
+
+    if self._buffer.token_count >= hard_max_tokens:
+        text = self._buffer.extract_at_boundary()  # Force at best boundary
+        await self._emit_and_wait(text)
+        continue
+
+    if hit_eos:
+        # Emit remainder and finish
+        break
+```
 
 #### TTS Synchronization
 
-The LLM waits for TTS to finish each segment before generating the next chunk, preventing audio buffer overflow:
+The LLM waits for TTS to finish each segment before generating the next, preventing audio buffer overflow:
 
 ```python
-# After emitting a chunk, wait for TTS signal
-await asyncio.wait_for(self._continue_event.wait(), timeout=30.0)
-self._continue_event.clear()
+async def _emit_and_wait(self, text: str):
+    await self.push_frame(LLMTextFrame(text=text))
+    self._buffer.reset_token_count()
+
+    await asyncio.wait_for(self._continue_event.wait(), timeout=30.0)
+    self._continue_event.clear()
 ```
 
-TTS sends `ChunkedLLMContinueGenerationFrame` upstream when a segment completes.
+TTS sends `ChunkedLLMContinueGenerationFrame` (from `frames.py`) upstream when a segment completes.
 
-#### Two-Slot Management
+#### 100% KV Cache Reuse
 
-To avoid llama.cpp race conditions when cancelling requests, the service alternates between two slots:
+With single-slot operation, the KV cache is never invalidated between turns:
 
-```python
-async def _get_next_slot(self) -> tuple[int, bool]:
-    # Prefer reusing last slot for KV cache hits
-    if self._last_used_slot is not None:
-        elapsed = time.time() - self._slot_last_used[self._last_used_slot]
-        if elapsed >= min_delay:
-            return self._last_used_slot, True  # Reuse for cache
-
-    # Otherwise rotate to avoid race conditions
-    slot = self._current_slot
-    self._current_slot = (self._current_slot + 1) % self._num_slots
-    return slot, False
 ```
+Turn 1: [system prompt][user: Hello][assistant: Hi there!]
+        └──────────────── cached ────────────────────────┘
+
+Turn 2: [system prompt][user: Hello][assistant: Hi there!][user: How are you?][assistant: ...]
+        └──────────────── 100% cache hit ─────────────────┘└── new tokens ──────────────────┘
+```
+
+The `LLMSlotMetricsFrame` tracks cache performance:
+- `first_segment_cache_hit_ratio`: High (>90%) = Fast TTFB (context cached)
+- `cache_hit_ratio`: Overall cache efficiency across all generations
 
 #### Timing Diagram
 
 ```
 User Input                   LLM Service                      TTS Service
      │                            │                                │
-     │──LLMContextFrame──────────►│                                │
+     │──LLMMessagesFrame─────────►│                                │
      │                            │                                │
      │                       format ChatML                         │
-     │                       start HTTP stream                     │
+     │                       generate 24 tokens (runs to end)      │
      │                            │                                │
-     │                       accumulate tokens                     │
-     │                       check sentence boundary               │
+     │                       buffer.add(text)                      │
+     │                       buffer.extract_complete_sentences()   │
      │                            │                                │
      │◄──────LLMTextFrame─────────│ "Hello! I'm happy to help."    │
-     │   (first chunk, ~100ms)    │────────────────────────────────┤
+     │   (first segment, ~100ms)  │────────────────────────────────┤
      │                            │                                │
      │                       wait for continue signal...           │
      │                            │                                │
      │                            │◄─ChunkedLLMContinueGeneration──│
      │                            │   (segment complete)           │
      │                            │                                │
-     │                       resume generation                     │
+     │                       generate 32 more tokens               │
+     │                       buffer.extract_complete_sentences()   │
      │                            │                                │
      │◄──────LLMTextFrame─────────│ "What would you like to know?" │
-     │   (second chunk)           │────────────────────────────────┤
+     │   (second segment)         │────────────────────────────────┤
      │                            │                                │
 ```
 
@@ -436,28 +491,49 @@ def _overlap_add(chunk1_tail: bytes, chunk2_head: bytes) -> bytes:
 
 ### Client-Side Implementation (`pipecat_bots/magpie_websocket_tts.py`)
 
-The Pipecat client extends `WebsocketTTSService` with adaptive mode selection.
+The Pipecat client extends `WebsocketTTSService` with adaptive mode selection and sentence splitting.
+
+#### Sentence Splitting for GPU Memory Safety
+
+The LLM may emit multiple sentences in a single `LLMTextFrame`. To prevent GPU OOM on long text, the TTS client splits incoming text into individual sentences before sending to the server:
+
+```python
+# Sentence boundary pattern - matches .!? followed by optional quotes/parens and space
+SENTENCE_BOUNDARY_PATTERN = re.compile(r'([.!?]["\'\)]*\s)')
+
+def split_into_sentences(text: str) -> list[str]:
+    """Split text into individual sentences for TTS."""
+    parts = SENTENCE_BOUNDARY_PATTERN.split(text)
+    # Recombine: each sentence = content + delimiter
+    ...
+```
+
+Each sentence is sent separately to the TTS server, keeping GPU memory usage bounded.
 
 #### Adaptive Mode Logic
 
 ```python
 async def run_tts(self, text: str):
-    msg = {"type": "text", "text": text}
+    # Split into individual sentences to keep TTS chunks small (avoid GPU OOM)
+    sentences = split_into_sentences(text)
 
-    if self._params.use_adaptive_mode:
-        if self._is_first_segment:
-            msg["mode"] = "stream"
-            msg["preset"] = self._params.streaming_preset
-        else:
-            msg["mode"] = "batch"
+    for sentence in sentences:
+        msg = {"type": "text", "text": sentence}
 
-    await self._get_websocket().send(json.dumps(msg))
+        if self._params.use_adaptive_mode:
+            if self._is_first_segment:
+                msg["mode"] = "stream"
+                msg["preset"] = self._params.streaming_preset
+            else:
+                msg["mode"] = "batch"
+
+        await self._get_websocket().send(json.dumps(msg))
 ```
 
 After receiving `segment_complete`, the client:
 1. Sets `_is_first_segment = False` for subsequent segments
 2. Optionally injects silence for sentence pauses
-3. Sends `ChunkedLLMContinueGenerationFrame` upstream to resume LLM generation
+3. Sends `ChunkedLLMContinueGenerationFrame` (from `frames.py`) upstream to resume LLM generation
 
 #### Interruption Handling
 
@@ -541,7 +617,8 @@ pipeline_processors = [
     rtvi,                       # Client communication
     stt,                        # NVidiaWebSocketSTTService
     context_aggregator.user(),  # Accumulate transcription
-    llm,                        # LlamaCppChunkedLLMService
+    context_timing,             # Log LLMMessagesFrame timing (debug)
+    llm,                        # LlamaCppBufferedLLMService (single-slot, 100% cache)
     tts,                        # MagpieWebSocketTTSService
     v2v_metrics,                # V2VMetricsProcessor
     transport.output(),         # Audio to user
@@ -563,8 +640,8 @@ The pipeline uses:
 |-------|-----------------|-------|
 | VAD silence detection | 200ms | Configurable via `stop_secs` |
 | STT final transcription | 30-50ms | Including 320ms padding for context |
-| LLM context processing | ~0ms | Immediate forwarding |
-| LLM first chunk | 100-150ms | 10-24 tokens with sentence boundary |
+| LLM context processing | ~0ms | 100% KV cache hit on subsequent turns |
+| LLM first segment | 100-150ms | 24-token limit with sentence boundary |
 | TTS first audio | 370ms | Conservative streaming preset |
 | **Total V2V** | **~500-700ms** | Measured at BotStartedSpeakingFrame |
 
@@ -573,3 +650,4 @@ The interleaved pipeline achieves sub-second response times by:
 2. Emitting LLM text at sentence boundaries (not waiting for full response)
 3. Using adaptive TTS (streaming for first segment, batch for quality thereafter)
 4. Synchronizing LLM/TTS to prevent buffer overflow
+5. Single-slot LLM operation for 100% KV cache reuse across turns

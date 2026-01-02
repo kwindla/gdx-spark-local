@@ -13,7 +13,7 @@
 # LLM Configuration:
 #   LLM_MODE                      - "llamacpp-q8" (default), "llamacpp-q4", or "vllm"
 #   LLAMA_MODEL                   - Path to GGUF model (required for llamacpp modes)
-#   LLAMA_PARALLEL                - Number of parallel slots (default: 2)
+#   LLAMA_PARALLEL                - Number of parallel slots (default: 1 for buffered LLM mode)
 #   LLAMA_CTX_SIZE                - Context size (default: 16384, enough for multi-turn voice)
 #   LLAMA_REASONING_BUDGET        - Thinking mode for Q4: 0=disabled, -1=unlimited (default: 0)
 #   VLLM_MODEL                    - Path to HF model dir (required for vllm mode)
@@ -56,7 +56,7 @@ if [[ "$LLM_MODE" == "vllm" ]]; then
 else
     SERVICE_TIMEOUT="${SERVICE_TIMEOUT:-60}"
 fi
-LLAMA_PARALLEL="${LLAMA_PARALLEL:-2}"
+LLAMA_PARALLEL="${LLAMA_PARALLEL:-1}"
 LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-16384}"
 LLAMA_REASONING_BUDGET="${LLAMA_REASONING_BUDGET:-0}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.60}"
