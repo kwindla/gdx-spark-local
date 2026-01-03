@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
-"""Run 20-turn voice agent test."""
-import subprocess
-import time
-import os
+"""Run 20-turn voice agent test with persistent WebRTC connection.
+
+This test maintains a single WebRTC connection across all 20 turns,
+enabling proper LLM KV cache reuse between turns.
+
+Usage:
+    uv run scripts/run_20_turn_test.py
+"""
+
+import asyncio
+import sys
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
+
+from voice_agent_test_client import MultiTurnVoiceAgentClient, TurnMetrics
 
 TEST_UTTERANCES = [
     # Short inputs (1 sentence)
@@ -12,7 +25,7 @@ TEST_UTTERANCES = [
     "How are you?",
     "What is two plus two?",
     "Goodbye.",
-    "Thanks!",
+    "Thanks very much!",
     "Can you help me?",
     "What do you think?",
     "That sounds good.",
@@ -30,35 +43,96 @@ TEST_UTTERANCES = [
 ]
 
 OUTPUT_DIR = "/tmp/20turn_test"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+SERVER_URL = "http://localhost:7860"
+TTS_URL = "http://localhost:8001"
+INTER_TURN_PAUSE = 1.0  # seconds
 
-print(f"Running 20-turn test, output to {OUTPUT_DIR}")
-print("=" * 60)
 
-for i, text in enumerate(TEST_UTTERANCES, 1):
-    print(f"\n[{i}/20] {text[:50]}{'...' if len(text) > 50 else ''}")
-    
-    result = subprocess.run(
-        [
-            "uv", "run", "scripts/voice_agent_test_client.py",
-            "--text", text,
-            "--output-dir", OUTPUT_DIR,
-            "--timeout", "45"
-        ],
-        capture_output=True,
-        text=True,
-        timeout=90
+def print_summary(results: list[TurnMetrics]):
+    """Print summary statistics for the test run."""
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+
+    # Per-turn results
+    print("\n| Turn | Utterance (first 30 chars) | Time to Response |")
+    print("|------|----------------------------|------------------|")
+    for m in results:
+        text_preview = m.utterance_text[:30] + "..." if len(m.utterance_text) > 30 else m.utterance_text
+        ttr = f"{m.time_to_response_ms:.0f}ms" if m.time_to_response_ms else "N/A"
+        print(f"| {m.turn_number:4} | {text_preview:28} | {ttr:>16} |")
+
+    # Statistics
+    valid_ttrs = [m.time_to_response_ms for m in results if m.time_to_response_ms]
+    if valid_ttrs:
+        print(f"\nTime to Response Statistics (n={len(valid_ttrs)}):")
+        print(f"  Min: {min(valid_ttrs):.0f}ms")
+        print(f"  Max: {max(valid_ttrs):.0f}ms")
+        print(f"  Avg: {sum(valid_ttrs) / len(valid_ttrs):.0f}ms")
+
+        # Percentiles
+        sorted_ttrs = sorted(valid_ttrs)
+        p50_idx = len(sorted_ttrs) // 2
+        p90_idx = int(len(sorted_ttrs) * 0.9)
+        print(f"  P50: {sorted_ttrs[p50_idx]:.0f}ms")
+        print(f"  P90: {sorted_ttrs[p90_idx]:.0f}ms")
+
+
+async def main():
+    print(f"Running 20-turn test with persistent connection")
+    print(f"Output directory: {OUTPUT_DIR}")
+    print("=" * 70)
+
+    client = MultiTurnVoiceAgentClient(
+        server_url=SERVER_URL,
+        tts_url=TTS_URL,
+        output_dir=OUTPUT_DIR,
     )
-    
-    if result.returncode != 0:
-        print(f"  ERROR: {result.stderr[-200:] if result.stderr else 'Unknown error'}")
-    else:
-        # Extract key metrics from output
-        for line in result.stdout.split('\n'):
-            if 'V2V' in line or 'TTFB' in line or 'complete' in line.lower():
-                print(f"  {line.strip()}")
-    
-    time.sleep(2)  # Brief pause between turns
 
-print("\n" + "=" * 60)
-print("Test complete!")
+    results: list[TurnMetrics] = []
+
+    try:
+        # Connect to bot
+        print("\nConnecting to bot...")
+        if not await client.connect():
+            print("Failed to connect")
+            return
+
+        # Wait for greeting to complete
+        if not await client.wait_for_greeting():
+            print("Failed to receive greeting")
+            return
+
+        print("\n" + "-" * 70)
+
+        # Run through all utterances
+        for i, utterance in enumerate(TEST_UTTERANCES):
+            turn_num = i + 1
+            print(f"\n[{turn_num}/{len(TEST_UTTERANCES)}] {utterance[:50]}{'...' if len(utterance) > 50 else ''}")
+
+            # Send turn and wait for response
+            metrics = await client.send_turn(utterance)
+            results.append(metrics)
+
+            # Print turn metrics
+            if metrics.time_to_response_ms:
+                print(f"  Time to response: {metrics.time_to_response_ms:.0f}ms")
+            if metrics.response_duration_ms:
+                print(f"  Response duration: {metrics.response_duration_ms:.0f}ms")
+
+            # Inter-turn pause (except after last turn)
+            if turn_num < len(TEST_UTTERANCES):
+                await asyncio.sleep(INTER_TURN_PAUSE)
+
+        print("\n" + "-" * 70)
+        print("All turns complete!")
+
+    finally:
+        await client.close()
+
+    # Print summary
+    print_summary(results)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

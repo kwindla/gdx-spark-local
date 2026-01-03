@@ -10,6 +10,16 @@ This document describes how to run the 20-turn voice-to-voice latency test and e
    - `NVIDIA_LLAMA_CPP_URL` (default: http://localhost:8000)
    - `NVIDIA_TTS_URL` (default: http://localhost:8001)
 
+## Test Architecture
+
+The test uses a **persistent WebRTC connection** across all 20 turns. This is critical for:
+
+1. **LLM KV Cache Reuse**: Conversation history is cached, reducing LLM TTFB from ~800ms to ~150ms on later turns
+2. **Realistic Conversation Flow**: Simulates actual multi-turn voice conversations
+3. **Proper Turn Timing**: Measures time from user audio completion to bot audio start
+
+The test client (`scripts/voice_agent_test_client.py`) synthesizes user audio via TTS, sends it over WebRTC at realtime pace, and measures when the bot starts/stops speaking.
+
 ## Running the Test
 
 ### Step 1: Start the Bot with Logging
@@ -32,7 +42,7 @@ tail -f /tmp/bot_v2v_test.log
 uv run scripts/run_20_turn_test.py
 ```
 
-The test runs 20 utterances (10 short, 10 long) with a 2-second pause between turns.
+The test runs 20 utterances (10 short, 10 long) with a 1-second pause between turns.
 
 ### Step 3: Stop the Bot
 
@@ -140,50 +150,108 @@ Formula: `V2V = VAD_STOP_SECS + ASR + LLM_first_segment + TTS_first_chunk`
 - **LLM TTFB**: Time from prompt submission to first token (using buffered/sentence-boundary streaming)
 - **TTS TTFB**: Time from text input to first audio chunk
 
-## Test Results (2026-01-02)
+## Test Results (2026-01-02, Persistent Connection)
 
-### Per-Turn Breakdown
+### Summary Statistics
 
-| Turn | V2V (ms) | ASR (ms) | LLM (ms) | TTS (ms) | Utterance Type |
-|------|----------|----------|----------|----------|----------------|
-| 1 | 1399 | 165 | 774 | 256 | Short |
-| 2 | 1485 | 247 | 824 | 211 | Short |
-| 3 | 1596 | 183 | 1004 | 206 | Short |
-| 4 | 1540 | 196 | 946 | 194 | Short |
-| 5 | 1219 | 161 | 662 | 193 | Short |
-| 6 | 1317 | 70 | 724 | 301 | Short |
-| 7 | 1342 | 57 | 847 | 234 | Short |
-| 8 | 1704 | 135 | 518 | 177 | Short |
-| 9 | 1730 | 81 | 567 | 171 | Short |
-| 10 | 1388 | 175 | 821 | 189 | Short |
-| 11 | 1247 | 26 | 808 | 191 | Long |
-| 12 | 1215 | 26 | 797 | 163 | Long |
-| 13 | 1247 | 25 | 813 | 185 | Long |
-| 14 | 1225 | 27 | 805 | 164 | Long |
-| 15 | 1257 | 28 | 809 | 194 | Long |
-| 16 | 1272 | 27 | 826 | 203 | Long |
-| 17 | 1231 | 32 | 814 | 174 | Long |
-| 18 | 1215 | 31 | 803 | 166 | Long |
-| 19 | 1292 | 28 | 802 | 196 | Long |
-| 20 | 1276 | 33 | 842 | 194 | Long |
+| Metric | Min | P50 | P90 | Max |
+|--------|-----|-----|-----|-----|
+| ASR    |  16ms |  18ms |  21ms |  24ms |
+| LLM    |  88ms | 162ms | 184ms | 205ms |
+| TTS    | 100ms | 107ms | 112ms | 113ms |
+| V2V    | 432ms | 508ms | 544ms | 3463ms |
 
-### Statistics
+**Note**: Max V2V of 3463ms is due to SmartTurn INCOMPLETE detection (see Known Behaviors below).
 
-| Metric | Min | Max | Average |
-|--------|-----|-----|---------|
-| V2V TTFB | 1215ms | 1730ms | 1360ms |
+### Per-Turn Results
+
+| Turn | Utterance | TTR (ms) | Response Duration |
+|------|-----------|----------|-------------------|
+| 1 | Hello there. | 424 | 2.6s |
+| 2 | What time is it? | 3465* | 7.3s |
+| 3 | Tell me a joke. | 540 | 4.7s |
+| 4 | How are you? | 447 | 3.3s |
+| 5 | What is two plus two? | 374 | 2.3s |
+| 6 | Goodbye. | 437 | 2.5s |
+| 7 | Thanks very much! | 421 | 2.7s |
+| 8 | Can you help me? | 3378* | 3.2s |
+| 9 | What do you think? | 452 | 3.4s |
+| 10 | That sounds good. | 445 | 2.7s |
+| 11-20 | (Long utterances) | 459-544 | 3.6-32.5s |
+
+*Turns marked with * had SmartTurn INCOMPLETE detection, adding ~3s delay.
+
+### LLM Cache Performance
+
+With persistent connection, LLM KV cache reuse improves significantly:
+
+| Turn Range | Cached Tokens | Cache Hit Rate |
+|------------|---------------|----------------|
+| 1-5 | 0-268 | 0-70% |
+| 6-10 | 156-316 | 52-77% |
+| 11-20 | 3000+ | 85-99% |
 
 ### Observations
 
-1. **ASR is faster for longer utterances**: Short utterances (turns 1-10) have ASR TTFB of 57-247ms, while long utterances (turns 11-20) have ASR TTFB of 25-33ms. This is because streaming ASR can return results while audio is still being received.
+1. **LLM cache reuse is critical**: With persistent connection, LLM TTFB drops from ~800ms (cold) to ~150ms (warm) due to KV cache reuse.
 
-2. **LLM is the dominant latency**: LLM TTFB accounts for ~60% of the total V2V time (600-1000ms out of 1200-1700ms total).
+2. **ASR is consistently fast**: 16-24ms across all turns with streaming ASR.
 
-3. **TTS is consistent**: TTS TTFB stays in the 160-300ms range across all turns.
+3. **TTS is consistent**: 100-113ms TTFB with WebSocket streaming.
 
-4. **VAD overhead**: The 200ms VAD stop delay is a fixed cost that could be reduced with more aggressive VAD settings (at the risk of cutting off users).
+4. **SmartTurn adds latency for ambiguous utterances**: Short questions like "What time is it?" and "Can you help me?" are classified as INCOMPLETE, causing a 3-second silence wait.
+
+## Known Behaviors
+
+### SmartTurn INCOMPLETE Detection
+
+The SmartTurn analyzer may classify short, ambiguous utterances as INCOMPLETE and wait up to 3 seconds for more input. This affects:
+- "What time is it?" - could be followed by more context
+- "Can you help me?" - open-ended question
+- Similar short questions that might have follow-up
+
+This is expected behavior to avoid cutting off users mid-thought.
+
+### Multi-Sentence Utterance Splitting
+
+Long utterances with natural pauses may be split by ASR into multiple transcripts:
+1. First sentence arrives, bot starts responding
+2. User continues speaking, interrupting the bot
+3. Full utterance arrives, bot gives complete response
+
+The test client handles this by measuring from audio completion to final bot response.
+
+### TTS GPU Memory
+
+The TTS warmup text must be long enough to pre-allocate GPU memory. Current warmup is 183 characters (matching longest test utterance). If TTS OOMs during inference, increase the warmup text length in `src/nemotron_speech/tts_server.py`.
+
+### Short Utterance Audio Detection
+
+Very short single-word utterances (like "Thanks!") may not be reliably detected by VAD due to WebRTC buffering. Use slightly longer phrases (e.g., "Thanks very much!") for reliable detection.
 
 ## Configuration Options
+
+### Test Client Timeout
+
+The test client waits for bot responses with a configurable timeout (default: 90 seconds). For conversations with long bot responses, this may need to be increased:
+
+```python
+# In scripts/voice_agent_test_client.py
+async def send_turn(self, text: str, timeout: float = 90.0) -> TurnMetrics:
+```
+
+### TTS Warmup Text
+
+To prevent TTS OOM errors, ensure warmup text matches the longest expected input:
+
+```python
+# In src/nemotron_speech/tts_server.py
+warmup_text = os.environ.get("TTS_WARMUP_TEXT", (
+    "I just finished reading a fascinating book about the history of computing. "
+    "It discussed how early computers filled entire rooms. "
+    "Tell me more about the evolution of computer hardware."
+))
+```
 
 ### Reduce VAD Stop Time
 

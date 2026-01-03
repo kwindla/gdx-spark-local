@@ -106,10 +106,19 @@ async def lifespan(app: FastAPI):
         import torch
         from nemotron_speech.streaming_tts import StreamingMagpieTTS, StreamingConfig
 
+        # Use a warmup text matching the longest expected input to pre-allocate GPU memory.
+        # Too short = OOM during long inference; too long = LLM can't load.
+        # ~180 chars matches the longest test utterances.
+        warmup_text = os.environ.get("TTS_WARMUP_TEXT", (
+            "I just finished reading a fascinating book about the history of computing. "
+            "It discussed how early computers filled entire rooms. "
+            "Tell me more about the evolution of computer hardware."
+        ))
+
         with torch.no_grad():
-            # Warm up batch path
-            logger.info("  Warming up batch inference...")
-            _, _ = model.do_tts("Warm up.", language="en", speaker_index=2, apply_TN=False)
+            # Warm up batch path with long text to allocate peak memory
+            logger.info(f"  Warming up batch inference ({len(warmup_text)} chars)...")
+            _, _ = model.do_tts(warmup_text, language="en", speaker_index=2, apply_TN=False)
             torch.cuda.synchronize()
 
             # Warm up streaming path (with CFG enabled for quality)
@@ -121,9 +130,15 @@ async def lifespan(app: FastAPI):
                 use_cfg=True,
             )
             streamer = StreamingMagpieTTS(model, config)
-            for _ in streamer.synthesize_streaming("Warm up.", language="en", speaker_index=2):
+            for _ in streamer.synthesize_streaming(warmup_text, language="en", speaker_index=2):
                 pass
             torch.cuda.synchronize()
+
+            # Release cached memory so LLM can load. The warmup pre-allocated peak
+            # memory for TTS inference; now we free the cached intermediates while
+            # keeping the model weights loaded.
+            torch.cuda.empty_cache()
+            logger.info("  Released CUDA cache after warmup")
 
     warmup_start = time.time()
     await asyncio.to_thread(_warmup)

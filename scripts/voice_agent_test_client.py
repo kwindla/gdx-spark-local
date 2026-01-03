@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""WebRTC test client for voice agent testing.
+"""WebRTC test client for multi-turn voice agent testing.
 
-Connects to the bot via WebRTC, sends audio at realtime rate,
-and captures response metrics and audio.
+Connects to the bot via WebRTC, maintains a persistent connection,
+and supports sending multiple audio turns with proper timing.
 
 Usage:
-    uv run scripts/voice_agent_test_client.py --audio-file /tmp/test.wav
+    # Multi-turn test (primary use case)
+    uv run scripts/run_20_turn_test.py
+
+    # Single turn via this script
     uv run scripts/voice_agent_test_client.py --text "Hello, how are you?"
 """
 
-import argparse
 import asyncio
 import json
 import os
-import struct
 import time
 import wave
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -32,161 +34,201 @@ except ImportError as e:
     exit(1)
 
 
-class AudioFileTrack(MediaStreamTrack):
-    """Audio track that plays from a WAV file at realtime rate."""
+@dataclass
+class TurnMetrics:
+    """Metrics collected for a single conversation turn."""
+    turn_number: int
+    utterance_text: str
+    utterance_duration_ms: float
+    audio_sent_time: float  # Timestamp when audio finished sending
+    bot_started_speaking_time: Optional[float] = None
+    bot_stopped_speaking_time: Optional[float] = None
+    events: list = field(default_factory=list)
+
+    @property
+    def time_to_response_ms(self) -> Optional[float]:
+        """Time from audio sent to bot starting to speak."""
+        if self.bot_started_speaking_time and self.audio_sent_time:
+            return (self.bot_started_speaking_time - self.audio_sent_time) * 1000
+        return None
+
+    @property
+    def response_duration_ms(self) -> Optional[float]:
+        """Duration of bot's response."""
+        if self.bot_started_speaking_time and self.bot_stopped_speaking_time:
+            return (self.bot_stopped_speaking_time - self.bot_started_speaking_time) * 1000
+        return None
+
+
+def load_audio_file(path: str, target_sample_rate: int = 16000) -> np.ndarray:
+    """Load audio from WAV or raw PCM file and resample to target rate."""
+    # Try to open as WAV first
+    try:
+        with wave.open(path, "rb") as wf:
+            nchannels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            raw_data = wf.readframes(wf.getnframes())
+    except wave.Error:
+        # Not a WAV file - assume raw PCM (Magpie format: 22kHz mono s16le)
+        with open(path, "rb") as f:
+            raw_data = f.read()
+        nchannels = 1
+        sampwidth = 2
+        framerate = 22000
+
+    # Convert to numpy array
+    if sampwidth == 2:
+        samples = np.frombuffer(raw_data, dtype=np.int16)
+    else:
+        raise ValueError(f"Unsupported sample width: {sampwidth}")
+
+    # Convert stereo to mono
+    if nchannels == 2:
+        samples = samples.reshape(-1, 2).mean(axis=1).astype(np.int16)
+
+    # Resample if needed
+    if framerate != target_sample_rate:
+        ratio = target_sample_rate / framerate
+        new_length = int(len(samples) * ratio)
+        indices = np.linspace(0, len(samples) - 1, new_length)
+        samples = np.interp(indices, np.arange(len(samples)), samples).astype(np.int16)
+
+    return samples
+
+
+class MultiTurnAudioTrack(MediaStreamTrack):
+    """Audio track that supports sending multiple audio segments across conversation turns.
+
+    Sends silence when idle, real audio when queued. Maintains realtime pacing.
+    """
 
     kind = "audio"
 
-    def __init__(self, path: str, sample_rate: int = 16000, start_event: Optional[asyncio.Event] = None):
+    def __init__(self, sample_rate: int = 16000):
         super().__init__()
-        self._path = path
         self._sample_rate = sample_rate
-        self._samples: Optional[np.ndarray] = None
-        self._position = 0
-        self._start_time: Optional[float] = None
         self._frame_duration = 0.02  # 20ms frames
         self._samples_per_frame = int(sample_rate * self._frame_duration)
-        self._start_event = start_event  # Wait for this before sending real audio
-        self._started = False
-        self._load_audio()
 
-    def _load_audio(self):
-        """Load audio from WAV or raw PCM file."""
-        # Try to open as WAV first
-        try:
-            with wave.open(self._path, "rb") as wf:
-                nchannels = wf.getnchannels()
-                sampwidth = wf.getsampwidth()
-                framerate = wf.getframerate()
-                raw_data = wf.readframes(wf.getnframes())
-        except wave.Error:
-            # Not a WAV file - assume raw PCM (Magpie format: 22kHz mono s16le)
-            print("Detected raw PCM audio, assuming Magpie TTS format (22kHz mono s16le)")
-            with open(self._path, "rb") as f:
-                raw_data = f.read()
-            nchannels = 1
-            sampwidth = 2
-            framerate = 22000
+        # Audio state
+        self._current_audio: Optional[np.ndarray] = None
+        self._audio_position = 0
+        self._audio_complete = asyncio.Event()
+        self._audio_complete.set()  # Initially complete (no audio pending)
 
-        # Convert to numpy array
-        if sampwidth == 2:
-            samples = np.frombuffer(raw_data, dtype=np.int16)
-        else:
-            raise ValueError(f"Unsupported sample width: {sampwidth}")
+        # Timing
+        self._start_time: Optional[float] = None
+        self._frame_count = 0
 
-        # Convert stereo to mono
-        if nchannels == 2:
-            samples = samples.reshape(-1, 2).mean(axis=1).astype(np.int16)
+    def queue_audio(self, samples: np.ndarray):
+        """Queue audio samples to be sent. Clears any previous audio."""
+        self._current_audio = samples
+        self._audio_position = 0
+        self._audio_complete.clear()
 
-        # Resample if needed (simple decimation/interpolation)
-        if framerate != self._sample_rate:
-            ratio = self._sample_rate / framerate
-            new_length = int(len(samples) * ratio)
-            indices = np.linspace(0, len(samples) - 1, new_length)
-            samples = np.interp(indices, np.arange(len(samples)), samples).astype(
-                np.int16
-            )
+    async def wait_for_completion(self) -> float:
+        """Wait until queued audio has been fully sent. Returns completion timestamp."""
+        await self._audio_complete.wait()
+        return time.time()
 
-        self._samples = samples
-        print(f"Loaded audio: {len(self._samples)} samples, {len(self._samples) / self._sample_rate:.2f}s")
+    def is_sending(self) -> bool:
+        """Check if currently sending non-silence audio."""
+        return self._current_audio is not None and self._audio_position < len(self._current_audio)
 
     async def recv(self) -> AudioFrame:
-        """Receive next audio frame at realtime rate.
-
-        Waits for start_event before sending real audio (sends silence while waiting).
-        Continues sending silence frames after audio ends to maintain connection.
-        """
-        # Track frame timing from first call
+        """Generate next audio frame at realtime rate."""
+        # Initialize timing on first call
         if self._start_time is None:
             self._start_time = time.time()
 
-        frame_num = self._position // self._samples_per_frame
-
-        # Wait for frame timing
-        expected_time = self._start_time + frame_num * self._frame_duration
+        # Calculate expected time for this frame
+        expected_time = self._start_time + self._frame_count * self._frame_duration
         now = time.time()
         if expected_time > now:
             await asyncio.sleep(expected_time - now)
 
-        # Check if we should start sending real audio
-        if not self._started:
-            if self._start_event is None or self._start_event.is_set():
-                self._started = True
-                self._position = 0  # Reset position when starting
-                print("Starting to send user audio")
-            else:
-                # Send silence while waiting for start event
-                samples = np.zeros(self._samples_per_frame, dtype=np.int16)
-                frame = AudioFrame(format="s16", layout="mono", samples=self._samples_per_frame)
-                frame.sample_rate = self._sample_rate
-                frame.pts = frame_num * self._samples_per_frame
-                frame.planes[0].update(samples.tobytes())
-                self._position += self._samples_per_frame
-                return frame
-
         # Get samples for this frame
-        start = self._position
-        end = min(start + self._samples_per_frame, len(self._samples))
+        if self._current_audio is not None and self._audio_position < len(self._current_audio):
+            # Send real audio
+            start = self._audio_position
+            end = min(start + self._samples_per_frame, len(self._current_audio))
+            samples = self._current_audio[start:end]
 
-        if start >= len(self._samples):
-            # End of audio - continue sending silence to maintain connection
-            samples = np.zeros(self._samples_per_frame, dtype=np.int16)
-            self._position += self._samples_per_frame
-        else:
-            samples = self._samples[start:end]
+            # Pad if needed
             if len(samples) < self._samples_per_frame:
                 samples = np.pad(samples, (0, self._samples_per_frame - len(samples)))
-            self._position = end
+
+            self._audio_position = end
+
+            # Check if audio is complete
+            if self._audio_position >= len(self._current_audio):
+                self._audio_complete.set()
+        else:
+            # Send silence
+            samples = np.zeros(self._samples_per_frame, dtype=np.int16)
 
         # Create AudioFrame
         frame = AudioFrame(format="s16", layout="mono", samples=self._samples_per_frame)
         frame.sample_rate = self._sample_rate
-        frame.pts = frame_num * self._samples_per_frame
+        frame.pts = self._frame_count * self._samples_per_frame
         frame.planes[0].update(samples.tobytes())
 
+        self._frame_count += 1
         return frame
 
 
-class VoiceAgentTestClient:
-    """WebRTC client for testing voice agents."""
+class MultiTurnVoiceAgentClient:
+    """WebRTC client for multi-turn voice agent testing.
+
+    Maintains a persistent connection and supports sending multiple turns.
+    """
 
     def __init__(
         self,
         server_url: str = "http://localhost:7860",
+        tts_url: str = "http://localhost:8001",
         output_dir: Optional[str] = None,
     ):
         self.server_url = server_url.rstrip("/")
+        self.tts_url = tts_url.rstrip("/")
         self.output_dir = Path(output_dir) if output_dir else Path("/tmp/voice_agent_test")
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.pc: Optional[RTCPeerConnection] = None
-        self.recorder: Optional[MediaRecorder] = None
-        self.events: list = []
-        self.start_time: Optional[float] = None
-        self.first_audio_time: Optional[float] = None
+        self.audio_track: Optional[MultiTurnAudioTrack] = None
         self.data_channel = None
 
-    async def connect(self, audio_path: str) -> bool:
-        """Connect to voice agent via WebRTC with audio track ready."""
-        self.pc = RTCPeerConnection()
-        self.start_time = time.time()
+        # Connection state
         self._connection_ready = asyncio.Event()
-        self._audio_start_event = asyncio.Event()  # Triggered when bot finishes greeting
+        self._bot_stopped_speaking = asyncio.Event()
 
-        # Load and add audio track BEFORE creating offer
-        # Audio track waits for _audio_start_event before sending real audio
-        self.audio_track = AudioFileTrack(audio_path, start_event=self._audio_start_event)
+        # Event tracking
+        self.all_events: list = []
+        self._turn_events: list = []  # Events for current turn
+        self._bot_stopped_count = 0
+        self._current_turn = 0
+        self.connection_start_time: Optional[float] = None
+
+        # Turn timing
+        self._bot_started_time: Optional[float] = None
+        self._bot_stopped_time: Optional[float] = None
+
+    async def connect(self) -> bool:
+        """Establish WebRTC connection to voice agent."""
+        self.pc = RTCPeerConnection()
+        self.connection_start_time = time.time()
+
+        # Create audio track that starts with silence
+        self.audio_track = MultiTurnAudioTrack()
         self.pc.addTrack(self.audio_track)
-        print(f"Added audio track: {self.audio_track._samples.shape[0] / self.audio_track._sample_rate:.2f}s")
 
-        # Create data channel for RTVI messages (client creates it)
+        # Create data channel for RTVI messages
         self.data_channel = self.pc.createDataChannel("rtvi-ai", ordered=True)
-        print("Created RTVI data channel")
 
         @self.data_channel.on("open")
         def on_dc_open():
             print("Data channel opened, sending client-ready")
-            # Send RTVI client-ready message in proper format
             ready_msg = json.dumps({
                 "label": "rtvi-ai",
                 "type": "client-ready",
@@ -197,41 +239,16 @@ class VoiceAgentTestClient:
 
         @self.data_channel.on("message")
         def on_dc_message(message):
-            try:
-                event = json.loads(message)
-                self.events.append({
-                    "time": time.time() - self.start_time,
-                    "event": event,
-                })
-                event_type = event.get("type", "unknown")
-                print(f"RTVI event: {event_type}")
-
-                # Mark connection ready when bot is ready
-                if event_type == "bot-ready":
-                    self._connection_ready.set()
-
-                # Start sending user audio when bot stops speaking (greeting finished)
-                if event_type == "bot-stopped-speaking":
-                    if not self._audio_start_event.is_set():
-                        print("Bot finished greeting, starting user audio")
-                        self._audio_start_event.set()
-            except json.JSONDecodeError:
-                pass
+            self._handle_rtvi_message(message)
 
         # Handle incoming audio track from bot
         @self.pc.on("track")
         def on_track(track):
             if track.kind == "audio":
                 print("Receiving bot audio track")
-                if self.first_audio_time is None:
-                    self.first_audio_time = time.time()
-                # Record received audio
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                self.recorder = MediaRecorder(str(self.output_dir / f"bot_response_{timestamp}.wav"))
-                self.recorder.addTrack(track)
-                asyncio.create_task(self.recorder.start())
+                # Could add recording here if needed
 
-        # Create offer with audio track already added
+        # Create and send offer
         offer = await self.pc.createOffer()
         await self.pc.setLocalDescription(offer)
 
@@ -254,98 +271,156 @@ class VoiceAgentTestClient:
                     )
                     print("WebRTC connection established")
 
-                    # Wait for bot-ready with timeout
+                    # Wait for bot-ready
                     try:
                         await asyncio.wait_for(self._connection_ready.wait(), timeout=10.0)
                         print("Bot is ready")
                     except asyncio.TimeoutError:
-                        print("Warning: Timeout waiting for bot-ready, continuing anyway")
+                        print("Warning: Timeout waiting for bot-ready")
 
                     return True
             except aiohttp.ClientError as e:
                 print(f"Connection error: {e}")
                 return False
 
-    async def wait_for_audio_sent(self):
-        """Wait for audio track to finish sending."""
-        if not hasattr(self, 'audio_track'):
-            return
+    def _handle_rtvi_message(self, message: str):
+        """Handle incoming RTVI message."""
+        try:
+            event = json.loads(message)
+            event_time = time.time()
 
-        # Wait for audio to finish
-        duration = len(self.audio_track._samples) / self.audio_track._sample_rate
-        print(f"Sending audio: {duration:.2f}s")
-        await asyncio.sleep(duration + 0.5)  # Extra time for processing
+            # Store event
+            event_record = {"time": event_time, "event": event}
+            self.all_events.append(event_record)
+            self._turn_events.append(event_record)
 
-    async def wait_for_response(self, timeout: float = 30.0):
-        """Wait for bot response to complete.
+            event_type = event.get("type", "unknown")
 
-        Waits for 2nd bot-stopped-speaking event (greeting + response).
+            if event_type == "bot-ready":
+                self._connection_ready.set()
+
+            elif event_type == "bot-started-speaking":
+                self._bot_started_time = event_time
+
+            elif event_type == "bot-stopped-speaking":
+                self._bot_stopped_count += 1
+                self._bot_stopped_time = event_time
+                self._bot_stopped_speaking.set()
+
+        except json.JSONDecodeError:
+            pass
+
+    async def wait_for_greeting(self, timeout: float = 30.0) -> bool:
+        """Wait for bot's initial greeting to complete."""
+        print("Waiting for bot greeting to complete...")
+        try:
+            await asyncio.wait_for(self._bot_stopped_speaking.wait(), timeout=timeout)
+            print("Bot greeting complete")
+            self._bot_stopped_speaking.clear()
+            return True
+        except asyncio.TimeoutError:
+            print("Timeout waiting for greeting")
+            return False
+
+    async def synthesize_audio(self, text: str) -> str:
+        """Synthesize audio from text using TTS service."""
+        output_path = f"/tmp/test_audio_{int(time.time() * 1000)}.pcm"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.tts_url}/v1/audio/speech",
+                json={"input": text, "voice": "aria", "model": "magpie"},
+                headers={"Content-Type": "application/json"},
+            ) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"TTS failed: {response.status}")
+                audio_data = await response.read()
+
+        with open(output_path, "wb") as f:
+            f.write(audio_data)
+
+        return output_path
+
+    async def send_turn(self, text: str, timeout: float = 90.0) -> TurnMetrics:
+        """Send a conversation turn and wait for bot response.
+
+        Args:
+            text: The utterance text to synthesize and send
+            timeout: Maximum time to wait for bot response
+
+        Returns:
+            TurnMetrics with timing and event data
         """
-        print(f"Waiting up to {timeout}s for response...")
-        start = time.time()
-        last_event_count = 0
+        self._current_turn += 1
+        self._turn_events = []
+        self._bot_stopped_speaking.clear()
+        self._bot_started_time = None
+        self._bot_stopped_time = None
 
-        # Wait for response audio
-        while time.time() - start < timeout:
-            await asyncio.sleep(0.1)  # Check frequently
+        # Synthesize audio (with retry on transient failures)
+        for attempt in range(3):
+            try:
+                audio_path = await self.synthesize_audio(text)
+                break
+            except RuntimeError as e:
+                if attempt < 2:
+                    print(f"  TTS failed, retrying... ({e})")
+                    await asyncio.sleep(0.5)
+                else:
+                    raise
 
-            # Count bot-stopped-speaking events
-            stopped_count = sum(
-                1 for e in self.events
-                if e["event"].get("type") == "bot-stopped-speaking"
-            )
+        samples = load_audio_file(audio_path)
+        utterance_duration_ms = len(samples) / self.audio_track._sample_rate * 1000
 
-            # Log progress
-            if len(self.events) > last_event_count:
-                for e in self.events[last_event_count:]:
-                    if e["event"].get("type") == "bot-started-speaking":
-                        print("Bot started speaking")
-                    elif e["event"].get("type") == "bot-stopped-speaking":
-                        print(f"Bot stopped speaking ({stopped_count} total)")
-                last_event_count = len(self.events)
+        # Queue audio and wait for it to be sent at realtime pace.
+        # During long utterances, natural speech pauses may trigger false starts
+        # where the bot briefly responds then gets interrupted when speech resumes.
+        self.audio_track.queue_audio(samples)
+        audio_sent_time = await self.audio_track.wait_for_completion()
 
-            # Done when we've seen 2 bot-stopped-speaking (greeting + response)
-            if stopped_count >= 2:
-                print("Bot response complete")
-                return True
+        # NOW clear timing state - ignore all false starts that occurred during audio.
+        # The real response will be the first bot speaking cycle AFTER audio is done.
+        self._bot_stopped_speaking.clear()
+        self._bot_started_time = None
+        self._bot_stopped_time = None
 
-        print("Timeout waiting for response")
-        return False
+        # Wait for the real bot response (after user truly finishes speaking)
+        try:
+            await asyncio.wait_for(self._bot_stopped_speaking.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            print(f"  Timeout waiting for response on turn {self._current_turn}")
+
+        # Clean up temp file
+        try:
+            os.unlink(audio_path)
+        except OSError:
+            pass
+
+        return TurnMetrics(
+            turn_number=self._current_turn,
+            utterance_text=text,
+            utterance_duration_ms=utterance_duration_ms,
+            audio_sent_time=audio_sent_time,
+            bot_started_speaking_time=self._bot_started_time,
+            bot_stopped_speaking_time=self._bot_stopped_time,
+            events=list(self._turn_events),
+        )
 
     async def close(self):
-        """Close connection and save results."""
-        if self.recorder:
-            await self.recorder.stop()
-
+        """Close the WebRTC connection."""
         if self.pc:
             await self.pc.close()
+            print("Connection closed")
 
-        # Save events log
-        events_file = self.output_dir / "events.json"
+        # Save all events
+        events_file = self.output_dir / "all_events.json"
         with open(events_file, "w") as f:
-            json.dump(self.events, f, indent=2)
-        print(f"Events saved to: {events_file}")
-
-        # Print summary
-        if self.first_audio_time and self.start_time:
-            ttfb = (self.first_audio_time - self.start_time) * 1000
-            print(f"Time to first audio: {ttfb:.0f}ms")
-
-    def get_metrics(self) -> dict:
-        """Get collected metrics."""
-        return {
-            "events": self.events,
-            "first_audio_ms": (
-                (self.first_audio_time - self.start_time) * 1000
-                if self.first_audio_time and self.start_time
-                else None
-            ),
-        }
+            json.dump(self.all_events, f, indent=2, default=str)
 
 
 async def synthesize_audio(text: str, tts_url: str = "http://localhost:8001") -> str:
-    """Synthesize audio from text using Magpie TTS (OpenAI-compatible API)."""
-    output_path = f"/tmp/test_audio_{int(time.time())}.pcm"
+    """Synthesize audio from text using Magpie TTS (standalone function for compatibility)."""
+    output_path = f"/tmp/test_audio_{int(time.time() * 1000)}.pcm"
 
     async with aiohttp.ClientSession() as session:
         async with session.post(
@@ -360,50 +435,42 @@ async def synthesize_audio(text: str, tts_url: str = "http://localhost:8001") ->
     with open(output_path, "wb") as f:
         f.write(audio_data)
 
-    print(f"Synthesized audio: {output_path} ({len(audio_data)} bytes)")
     return output_path
 
 
 async def main():
+    """Simple single-turn test for standalone usage."""
+    import argparse
+
     parser = argparse.ArgumentParser(description="Voice agent test client")
-    parser.add_argument("--audio-file", help="Path to audio file to send")
-    parser.add_argument("--text", help="Text to synthesize and send")
+    parser.add_argument("--text", required=True, help="Text to synthesize and send")
     parser.add_argument("--server-url", default="http://localhost:7860", help="Bot server URL")
     parser.add_argument("--tts-url", default="http://localhost:8001", help="TTS server URL")
     parser.add_argument("--output-dir", default="/tmp/voice_agent_test", help="Output directory")
     parser.add_argument("--timeout", type=float, default=30.0, help="Response timeout")
     args = parser.parse_args()
 
-    # Get audio file
-    audio_path = args.audio_file
-    if args.text and not audio_path:
-        audio_path = await synthesize_audio(args.text, args.tts_url)
-    elif not audio_path:
-        print("Error: Provide --audio-file or --text")
-        return
-
-    if not os.path.exists(audio_path):
-        print(f"Error: Audio file not found: {audio_path}")
-        return
-
-    # Run test
-    client = VoiceAgentTestClient(
+    client = MultiTurnVoiceAgentClient(
         server_url=args.server_url,
+        tts_url=args.tts_url,
         output_dir=args.output_dir,
     )
 
     try:
-        if not await client.connect(audio_path):
+        if not await client.connect():
             return
 
-        await client.wait_for_audio_sent()
-        await client.wait_for_response(timeout=args.timeout)
+        await client.wait_for_greeting()
 
-        metrics = client.get_metrics()
+        metrics = await client.send_turn(args.text, timeout=args.timeout)
+
         print(f"\nResults:")
-        print(f"  Events: {len(metrics['events'])}")
-        if metrics["first_audio_ms"]:
-            print(f"  Time to first audio: {metrics['first_audio_ms']:.0f}ms")
+        print(f"  Utterance: {metrics.utterance_text[:50]}...")
+        print(f"  Utterance duration: {metrics.utterance_duration_ms:.0f}ms")
+        if metrics.time_to_response_ms:
+            print(f"  Time to response: {metrics.time_to_response_ms:.0f}ms")
+        if metrics.response_duration_ms:
+            print(f"  Response duration: {metrics.response_duration_ms:.0f}ms")
 
     finally:
         await client.close()
