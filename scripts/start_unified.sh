@@ -13,8 +13,8 @@
 # LLM Configuration:
 #   LLM_MODE                      - "llamacpp-q8" (default), "llamacpp-q4", or "vllm"
 #   LLAMA_MODEL                   - Path to GGUF model (required for llamacpp modes)
-#   LLAMA_PARALLEL                - Number of parallel slots (default: 2)
-#   LLAMA_CTX_SIZE                - Context size (Q8 default: 65536, Q4 default: 4096)
+#   LLAMA_PARALLEL                - Number of parallel slots (default: 1 for buffered LLM mode)
+#   LLAMA_CTX_SIZE                - Context size (default: 16384, enough for multi-turn voice)
 #   LLAMA_REASONING_BUDGET        - Thinking mode for Q4: 0=disabled, -1=unlimited (default: 0)
 #   VLLM_MODEL                    - Path to HF model dir (required for vllm mode)
 #   VLLM_GPU_MEMORY_UTILIZATION   - GPU memory fraction (default: 0.60)
@@ -56,8 +56,8 @@ if [[ "$LLM_MODE" == "vllm" ]]; then
 else
     SERVICE_TIMEOUT="${SERVICE_TIMEOUT:-60}"
 fi
-LLAMA_PARALLEL="${LLAMA_PARALLEL:-2}"
-LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-65536}"
+LLAMA_PARALLEL="${LLAMA_PARALLEL:-1}"
+LLAMA_CTX_SIZE="${LLAMA_CTX_SIZE:-16384}"
 LLAMA_REASONING_BUDGET="${LLAMA_REASONING_BUDGET:-0}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.60}"
 
@@ -309,8 +309,8 @@ if [ "$ENABLE_LLM" = "true" ]; then
             ;;
         llamacpp-q4)
             echo "  Mode: llama.cpp Q4 (optimized for 32GB GPU)"
-            # Q4 defaults: ctx=4096 (vs 65536), all layers on GPU, quantized KV cache
-            LLAMA_Q4_CTX_SIZE="${LLAMA_CTX_SIZE:-4096}"
+            # Q4 uses same context as Q8 (default 16384), all layers on GPU, quantized KV cache
+            LLAMA_Q4_CTX_SIZE="${LLAMA_CTX_SIZE:-16384}"
             llama-server \
                 -m "${LLAMA_MODEL}" \
                 --host 0.0.0.0 \

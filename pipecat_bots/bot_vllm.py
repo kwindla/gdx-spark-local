@@ -44,6 +44,7 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 # Import our custom local services
 from nvidia_stt import NVidiaWebSocketSTTService
 from magpie_websocket_tts import MagpieWebSocketTTSService
+from v2v_metrics import V2VMetricsProcessor
 
 load_dotenv(override=True)
 
@@ -57,25 +58,27 @@ NVIDIA_LLM_MODEL = os.getenv(
 NVIDIA_LLM_API_KEY = os.getenv("NVIDIA_LLM_API_KEY", "not-needed")
 NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
 
+# VAD configuration - used by both VAD analyzer and V2V metrics
+VAD_STOP_SECS = 0.2
+
 # Transport configurations with VAD and SmartTurn analyzer
-# stop_secs=0.34 aligns with ASR model's trailing context requirements
 transport_params = {
     "daily": lambda: DailyParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "twilio": lambda: FastAPIWebsocketParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
     "webrtc": lambda: TransportParams(
         audio_in_enabled=True,
         audio_out_enabled=True,
-        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=0.34)),
+        vad_analyzer=SileroVADAnalyzer(params=VADParams(stop_secs=VAD_STOP_SECS)),
         turn_analyzer=LocalSmartTurnAnalyzerV3(params=SmartTurnParams()),
     ),
 }
@@ -88,6 +91,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     logger.info(f"  LLM Model: {NVIDIA_LLM_MODEL}")
     logger.info(f"  TTS URL: {NVIDIA_TTS_URL}")
     logger.info(f"  Transport: {type(transport).__name__}")
+    logger.info(f"  VAD stop_secs: {VAD_STOP_SECS}s")
 
     # NVIDIA Parakeet ASR via WebSocket
     stt = NVidiaWebSocketSTTService(
@@ -124,6 +128,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     )
     logger.info("Using vLLM via OpenAILLMService (thinking disabled)")
 
+    # Voice-to-voice response time metrics
+    v2v_metrics = V2VMetricsProcessor(vad_stop_secs=VAD_STOP_SECS)
+
     messages = [
         {
             "role": "system",
@@ -157,6 +164,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             context_aggregator.user(),
             llm,
             tts,
+            v2v_metrics,
             transport.output(),
             context_aggregator.assistant(),
         ]

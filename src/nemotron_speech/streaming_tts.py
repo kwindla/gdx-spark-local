@@ -41,6 +41,7 @@ from typing import Generator, Optional
 
 import numpy as np
 import torch
+from loguru import logger
 
 
 @dataclass
@@ -99,6 +100,11 @@ class StreamingMagpieTTS:
 
     SAMPLE_RATE = 22000
     SAMPLES_PER_FRAME = 1024
+    # Samples to preserve at chunk boundaries for server-side crossfade (80ms)
+    # Increased from 40ms to 80ms to provide smoother transitions when the
+    # non-causal HiFi-GAN vocoder produces uncorrelated waveforms at boundaries
+    PRESERVE_OVERLAP_SAMPLES = int(SAMPLE_RATE * 0.080)  # 1760 samples = 80ms
+
 
     def __init__(self, model, config: Optional[StreamingConfig] = None):
         """
@@ -260,6 +266,7 @@ class StreamingMagpieTTS:
                         )
                         if end_frame_index != float('inf'):
                             end_indices[item_idx] = idx * model.frame_stacking_factor + end_frame_index
+                            logger.debug(f"Streaming: EOS detected at step {idx}, frame_stacking={model.frame_stacking_factor}, end_frame_index={end_frame_index}, global_eos_frame={end_indices[item_idx]}")
 
                 # Accumulate predictions
                 all_predictions.append(audio_codes_next)
@@ -294,29 +301,46 @@ class StreamingMagpieTTS:
                     if overlap_buffer is not None:
                         decode_codes = torch.cat([overlap_buffer, pending_codes], dim=-1)
                         overlap_samples = cfg.overlap_frames * self.SAMPLES_PER_FRAME
+                        overlap_frames = cfg.overlap_frames
                     else:
                         decode_codes = pending_codes
                         overlap_samples = 0
+                        overlap_frames = 0
 
-                    # Decode to audio
-                    decode_lens = torch.tensor(
-                        [decode_codes.size(-1)], device=decode_codes.device
-                    ).long()
+                    # Determine decode length - truncate at EOS if detected
+                    # CRITICAL: Must actually slice the tensor, not just set length!
+                    # HiFi-GAN decoder processes ALL tokens in tensor regardless of tokens_len parameter.
+                    # In batch mode this works because generation stops at EOS so tensor only has valid tokens.
+                    # In streaming we must explicitly slice to match batch behavior.
+                    if len(end_indices) > 0 and 0 in end_indices:
+                        # Calculate EOS frame position relative to current decode_codes
+                        # end_indices[0] is global frame index, we need local index
+                        total_frames_before = (len(all_predictions) - len(pending_tokens)) * model.frame_stacking_factor
+                        eos_global_frame = end_indices[0]
+                        eos_local_frame = eos_global_frame - total_frames_before + overlap_frames
+                        # Truncate at EOS frame - do NOT include the EOS frame itself
+                        # This matches batch mode: predicted_lens = [end_indices.get(idx, max_decoder_steps)]
+                        # where the EOS index is used directly as length (exclusive end)
+                        truncated_len = min(eos_local_frame, decode_codes.size(-1))
+                        logger.debug(f"Streaming: Truncating at EOS, global_frame={eos_global_frame}, local_frame={eos_local_frame}, truncated_len={truncated_len}, decode_codes_len={decode_codes.size(-1)}")
+                        # Actually slice the tensor - HiFi-GAN processes ALL input tokens
+                        decode_codes = decode_codes[..., :truncated_len]
+                        decode_lens = torch.tensor([truncated_len], device=decode_codes.device).long()
+                    else:
+                        decode_lens = torch.tensor([decode_codes.size(-1)], device=decode_codes.device).long()
+
                     audio, audio_len = model.codes_to_audio(decode_codes, decode_lens)
 
-                    # Extract new audio (skip overlap region)
+                    # Extract new audio (skip overlap region, but preserve some for server-side blending)
+                    # The preserved overlap represents the same time period as the previous chunk's tail,
+                    # enabling COLA-compliant overlap-add at the server with zero audio loss
                     if overlap_samples > 0:
-                        new_audio = audio[..., overlap_samples:]
-                        if cfg.use_crossfade and hasattr(self, '_prev_tail'):
-                            new_audio = self._apply_crossfade(
-                                self._prev_tail, new_audio, cfg.crossfade_samples
-                            )
+                        preserve = min(overlap_samples, self.PRESERVE_OVERLAP_SAMPLES)
+                        new_audio = audio[..., overlap_samples - preserve:]
+                        logger.debug(f"Streaming chunk: audio_len={audio.shape[-1]}, overlap_samples={overlap_samples}, preserve={preserve}, new_audio_len={new_audio.shape[-1]}")
                     else:
                         new_audio = audio
-
-                    # Save tail for next crossfade
-                    if cfg.use_crossfade:
-                        self._prev_tail = new_audio[..., -cfg.crossfade_samples:].clone()
+                        logger.debug(f"Streaming chunk (first): audio_len={audio.shape[-1]}, no overlap")
 
                     # Update overlap buffer for next chunk
                     if pending_codes.size(-1) >= cfg.overlap_frames:
@@ -333,6 +357,7 @@ class StreamingMagpieTTS:
 
                 # Check termination
                 if len(end_indices) == text.size(0) and len(all_predictions) >= 4:
+                    logger.debug(f"Streaming: All EOS detected at step {idx}, ending generation")
                     break
 
             # Yield any remaining audio
@@ -341,26 +366,41 @@ class StreamingMagpieTTS:
                 if overlap_buffer is not None:
                     decode_codes = torch.cat([overlap_buffer, pending_codes], dim=-1)
                     overlap_samples = cfg.overlap_frames * self.SAMPLES_PER_FRAME
+                    overlap_frames = cfg.overlap_frames
                 else:
                     decode_codes = pending_codes
                     overlap_samples = 0
+                    overlap_frames = 0
 
-                decode_lens = torch.tensor(
-                    [decode_codes.size(-1)], device=decode_codes.device
-                ).long()
+                # Truncate at EOS if detected (same as main loop)
+                # CRITICAL: Must actually slice tensor - HiFi-GAN ignores tokens_len for computation
+                if len(end_indices) > 0 and 0 in end_indices:
+                    total_frames_before = (len(all_predictions) - len(pending_tokens)) * model.frame_stacking_factor
+                    eos_global_frame = end_indices[0]
+                    eos_local_frame = eos_global_frame - total_frames_before + overlap_frames
+                    # Do NOT include EOS frame itself (matches batch mode)
+                    truncated_len = min(eos_local_frame, decode_codes.size(-1))
+                    logger.debug(f"Streaming final: Truncating at EOS, truncated_len={truncated_len}, decode_codes_len={decode_codes.size(-1)}")
+                    # Actually slice the tensor
+                    decode_codes = decode_codes[..., :truncated_len]
+                    decode_lens = torch.tensor([truncated_len], device=decode_codes.device).long()
+                else:
+                    decode_lens = torch.tensor([decode_codes.size(-1)], device=decode_codes.device).long()
+
                 audio, _ = model.codes_to_audio(decode_codes, decode_lens)
 
+                # Preserve overlap for server-side blending (same as main loop)
                 if overlap_samples > 0:
-                    new_audio = audio[..., overlap_samples:]
+                    preserve = min(overlap_samples, self.PRESERVE_OVERLAP_SAMPLES)
+                    new_audio = audio[..., overlap_samples - preserve:]
+                    logger.debug(f"Streaming final chunk: audio_len={audio.shape[-1]}, overlap_samples={overlap_samples}, preserve={preserve}, new_audio_len={new_audio.shape[-1]}")
                 else:
                     new_audio = audio
+                    logger.debug(f"Streaming final chunk (first): audio_len={audio.shape[-1]}, no overlap")
 
                 audio_bytes = self._audio_to_bytes(new_audio)
+                logger.debug(f"Streaming complete: yielding final {len(audio_bytes)} bytes")
                 yield audio_bytes
-
-            # Cleanup
-            if hasattr(self, '_prev_tail'):
-                del self._prev_tail
 
     def _prepare_batch(
         self, text: str, language: str, speaker_index: int, apply_tn: bool

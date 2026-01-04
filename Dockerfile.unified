@@ -409,7 +409,14 @@ RUN uv pip install --no-cache triton && \
 #
 # Pinned to commit c18428423018ed214c004e6ecaedb0cbdda06805 (Dec 24, 2025)
 # which is the version in the working vllm-llamacpp:cuda13 container.
+#
+# Patch: llama-cpp-hybrid-cache-fix.patch
+# Fixes crash with hybrid models (Mamba/Transformer like Nemotron) when
+# consecutive requests have identical token counts. The crash occurs at:
+#   GGML_ASSERT(!slot.is_processing()) in server-context.cpp:1011
+# See docs/llama-cpp-crash-investigation-plan.md for details.
 ARG LLAMACPP_COMMIT=c18428423018ed214c004e6ecaedb0cbdda06805
+COPY patches/llama-cpp-hybrid-cache-fix.patch /tmp/llama-cpp-hybrid-cache-fix.patch
 RUN ARCH=$(uname -m) && \
     if [ "$ARCH" = "aarch64" ]; then \
         CUDA_ARCH="121a"; \
@@ -419,6 +426,8 @@ RUN ARCH=$(uname -m) && \
     echo "=== Building llama.cpp for $ARCH with CUDA arch $CUDA_ARCH ===" && \
     git clone https://github.com/ggerganov/llama.cpp.git /opt/llama.cpp && \
     cd /opt/llama.cpp && git checkout ${LLAMACPP_COMMIT} && \
+    echo "=== Applying hybrid cache fix patch ===" && \
+    patch -p1 < /tmp/llama-cpp-hybrid-cache-fix.patch && \
     cmake -B build \
         -DGGML_CUDA=ON \
         -DGGML_CUDA_F16=ON \
