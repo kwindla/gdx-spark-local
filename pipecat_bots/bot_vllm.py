@@ -33,6 +33,7 @@ from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.sentence import SentenceAggregator
 from pipecat.processors.frameworks.rtvi import RTVIConfig, RTVIObserver, RTVIProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
@@ -107,9 +108,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         params=MagpieWebSocketTTSService.InputParams(
             language="en",
             streaming_preset="conservative",
+            use_adaptive_mode=True,
         ),
     )
-    logger.info("Using WebSocket Magpie TTS (batch mode)")
+    logger.info("Using WebSocket Magpie TTS (adaptive mode)")
 
     # vLLM via OpenAI-compatible API
     llm = OpenAILLMService(
@@ -152,6 +154,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
 
     context = LLMContext(messages)
     context_aggregator = LLMContextAggregatorPair(context)
+    sentence_aggregator = SentenceAggregator()
 
     # RTVI processor for client communication
     rtvi = RTVIProcessor(config=RTVIConfig(config=[]))
@@ -163,6 +166,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             stt,
             context_aggregator.user(),
             llm,
+            sentence_aggregator,
             tts,
             # v2v_metrics,
             transport.output(),
