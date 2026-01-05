@@ -121,7 +121,7 @@ RIGHT_CONTEXT = 1
     },
     gpu="L40S",  
     timeout=3600,
-    min_containers=1,  # Keep warm for low latency
+    # min_containers=1,  # Keep warm for low latency
 )
 class NemotronASRModel:
     """Modal class for Nemotron ASR inference."""

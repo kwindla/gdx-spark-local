@@ -75,6 +75,8 @@ modal deploy -m src.nemotron_speech.modal.tts_server_modal
 modal deploy -m src.nemotron_speech.modal.vllm_modal
 ```
 
+The ASR deployment takes about 30 seconds to cold-start, 60 seconds for TTS, and about 3 minutes for vLLM. You can uncomment the `min_containers = 1` input to the Modal `Function` and `Cls` decorators to ensure that bots can start up quickly for production or development.
+
 ### Run the bot locally or using Pipecat Cloud
 ```bash
 uv run -m pipecat_bots.modal.bot_modal

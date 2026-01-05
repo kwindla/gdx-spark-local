@@ -58,7 +58,7 @@ VLLM_PORT = 8000
         "/root/.cache/huggingface": hf_cache_vol,
         "/root/.cache/vllm": vllm_cache_vol,
     },
-    min_containers = 1,
+    # min_containers = 1,
 )
 @modal.concurrent(  # how many requests can one replica handle? tune carefully!
     max_inputs=32
