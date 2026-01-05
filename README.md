@@ -46,13 +46,37 @@ uv run pipecat_bots/bot_interleaved_streaming.py
 
 Open `http://localhost:7860/client` in your browser.
 
-## Quick start - deploy to the cloud
+## Quick start - deploy to the cloud with Modal
 
-### Model deployment to Modal
+### Prerequisites
 
-### Bot deployment to Pipecat Cloud
+Create a [Modal](modal.com) account if you don't have one.
 
-*** Jon to fill in? ***
+```bash
+# Authenticate with Modal
+modal setup
+
+# Set HuggingFace token for gated model access (if necessary)
+modal secret create huggingface HF_TOKEN=your_token_here
+```
+
+### Deploy Services to Modal
+
+```bash
+# Deploy ASR service
+modal deploy -m src.nemotron_speech.modal.asr_server_modal
+
+# Deploy TTS service
+modal deploy -m src.nemotron_speech.modal.tts_server_modal
+
+# Deploy vLLM service
+modal deploy -m src.nemotron_speech.modal.vllm_modal
+```
+
+### Run the bot locally or using Pipecat Cloud
+```bash
+uv run -m pipecat_bots.modal.bot_modal
+```
 
 ## Bot Variants
 
