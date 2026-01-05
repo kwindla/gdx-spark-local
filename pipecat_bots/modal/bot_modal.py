@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 #
-# Pipecat bot using vLLM for higher quality inference.
+# Pipecat bot using Modal deployed AI services. Similar to bot_vllm.py, but uses Modal deployed services instead of local services.
 #
-# Uses vLLM (OpenAI-compatible API) instead of llama.cpp. Requires more VRAM (~72GB)
-# but provides higher quality inference with full BF16 weights.
 #
-# Environment variables:
-#   NVIDIA_ASR_URL        ASR WebSocket URL (default: ws://localhost:8080)
-#   NVIDIA_LLM_URL        vLLM API URL (default: http://localhost:8000/v1)
+# Optional nvironment variables. URLs default to querying Modal deployments for endpoints.
+#   NVIDIA_ASR_URL        ASR WebSocket URL 
+#   NVIDIA_LLM_URL        vLLM API URL 
 #   NVIDIA_LLM_MODEL      Model name/path (default: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
 #   NVIDIA_LLM_API_KEY    API key for vLLM (default: not-needed)
-#   NVIDIA_TTS_URL        Magpie TTS server URL (default: http://localhost:8001)
+#   NVIDIA_TTS_URL        Magpie TTS server URL 
 #
 # Usage:
-#   uv run pipecat_bots/bot_vllm.py
-#   uv run pipecat_bots/bot_vllm.py -t daily
-#   uv run pipecat_bots/bot_vllm.py -t webrtc
+#   uv run pipecat_bots/bot_modal.py
+#   uv run pipecat_bots/bot_modal.py -t daily
+#   uv run pipecat_bots/bot_modal.py -t webrtc
 #
 
 import os
