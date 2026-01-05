@@ -35,12 +35,13 @@ VALID_SERVICES = [
     'cartesia',
     'faster_whisper',
     'speechmatics',
+    'soniox',
 ]
 
 GROUND_TRUTH_FILE = 'asr_eval_data/ground_truth_runs/2026-01-03_17-00-06.jsonl'
 
 
-async def run_evaluation(service_name: str):
+async def run_evaluation(service_name: str, transcription_file: str = None):
     start_time = time.time()
     date_str = datetime.now().strftime('%Y-%m-%d')
 
@@ -59,25 +60,37 @@ async def run_evaluation(service_name: str):
 
     print(f"Loaded {len(gt_data)} ground truth samples")
 
-    # Find samples with ground truth and non-empty transcriptions
-    async with aiosqlite.connect('asr_eval_data/results.db') as db:
-        db.row_factory = aiosqlite.Row
-        cursor = await db.execute('''
-            SELECT t.sample_id, t.transcribed_text
-            FROM transcriptions t
-            WHERE t.service_name = ?
-            AND t.transcribed_text != ""
-        ''', (service_name,))
-        rows = await cursor.fetchall()
+    # Load transcriptions from file or database
+    if transcription_file:
+        print(f"Loading transcriptions from: {transcription_file}")
+        rows = []
+        with open(transcription_file, 'r') as f:
+            for line in f:
+                data = json.loads(line)
+                if data.get('type') == 'result' and data.get('transcribed_text'):
+                    rows.append({'sample_id': data['sample_id'], 'transcribed_text': data['transcribed_text']})
+    else:
+        # Find samples with ground truth and non-empty transcriptions from database
+        async with aiosqlite.connect('asr_eval_data/results.db') as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute('''
+                SELECT t.sample_id, t.transcribed_text
+                FROM transcriptions t
+                WHERE t.service_name = ?
+                AND t.transcribed_text != ""
+            ''', (service_name,))
+            rows = await cursor.fetchall()
 
     # Filter to samples with ground truth
     samples = []
     for row in rows:
-        if row['sample_id'] in gt_data:
+        sample_id = row['sample_id'] if isinstance(row, dict) else row['sample_id']
+        transcribed_text = row['transcribed_text'] if isinstance(row, dict) else row['transcribed_text']
+        if sample_id in gt_data:
             samples.append({
-                'sample_id': row['sample_id'],
-                'ground_truth': gt_data[row['sample_id']],
-                'transcription': row['transcribed_text']
+                'sample_id': sample_id,
+                'ground_truth': gt_data[sample_id],
+                'transcription': transcribed_text
             })
 
     print(f"Found {len(samples)} {service_name} samples with ground truth")
@@ -157,9 +170,11 @@ def main():
     parser = argparse.ArgumentParser(description='Run Agent SDK judge evaluation')
     parser.add_argument('--service', '-s', required=True, choices=VALID_SERVICES,
                         help='ASR service to evaluate')
+    parser.add_argument('--file', '-f', type=str, default=None,
+                        help='JSONL file with transcriptions (instead of database)')
     args = parser.parse_args()
 
-    asyncio.run(run_evaluation(args.service))
+    asyncio.run(run_evaluation(args.service, args.file))
 
 
 if __name__ == '__main__':

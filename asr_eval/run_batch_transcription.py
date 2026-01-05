@@ -23,7 +23,9 @@ def parse_args():
     parser.add_argument("--service", required=True, choices=[s.value for s in ServiceName])
     parser.add_argument("--model", default=None, help="Model name (e.g., nova-3, whisper-large)")
     parser.add_argument("--samples", type=int, default=1000, help="Number of samples to transcribe")
+    parser.add_argument("--offset", type=int, default=0, help="Skip first N samples (for resuming)")
     parser.add_argument("--output", default=None, help="Output JSONL file path")
+    parser.add_argument("--append", action="store_true", help="Append to existing output file")
     parser.add_argument("--vad-stop-ms", type=int, default=200, help="VAD stop detection ms")
     parser.add_argument("--post-silence-ms", type=int, default=2000, help="Post-audio silence ms")
     return parser.parse_args()
@@ -55,8 +57,13 @@ async def run_batch(args):
 
     # Get samples (sorted by dataset_index for repeatability)
     all_samples = await db.get_all_samples()
-    samples = all_samples[:args.samples]
-    logger.info(f"Selected {len(samples)} samples for transcription")
+    # Apply offset and limit
+    end_idx = args.offset + args.samples
+    samples = all_samples[args.offset:end_idx]
+    if args.offset > 0:
+        logger.info(f"Resuming from sample {args.offset}, processing {len(samples)} samples")
+    else:
+        logger.info(f"Selected {len(samples)} samples for transcription")
 
     # Create adapter
     adapter = PipelineSTTAdapter(
@@ -66,18 +73,21 @@ async def run_batch(args):
         post_audio_silence_ms=args.post_silence_ms,
     )
 
-    # Write header
-    with open(output_path, "w") as f:
-        header = {
-            "type": "header",
-            "service": service_name.value,
-            "model": model_label,
-            "num_samples": len(samples),
-            "vad_stop_ms": args.vad_stop_ms,
-            "post_silence_ms": args.post_silence_ms,
-            "started_at": datetime.now(timezone.utc).isoformat(),
-        }
-        f.write(json.dumps(header) + "\n")
+    # Write header (skip if appending)
+    if not args.append:
+        with open(output_path, "w") as f:
+            header = {
+                "type": "header",
+                "service": service_name.value,
+                "model": model_label,
+                "num_samples": len(samples),
+                "vad_stop_ms": args.vad_stop_ms,
+                "post_silence_ms": args.post_silence_ms,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+            }
+            f.write(json.dumps(header) + "\n")
+    else:
+        logger.info(f"Appending to existing file: {output_path}")
 
     # Process samples
     successful = 0
@@ -123,18 +133,19 @@ async def run_batch(args):
                 }
                 f.write(json.dumps(record) + "\n")
 
-    # Write summary
+    # Write summary (skip if appending - user should compute final summary)
     avg_latency = total_latency / successful if successful > 0 else 0
-    with open(output_path, "a") as f:
-        summary = {
-            "type": "summary",
-            "successful": successful,
-            "failed": failed,
-            "total": len(samples),
-            "avg_latency_ms": avg_latency,
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-        }
-        f.write(json.dumps(summary) + "\n")
+    if not args.append:
+        with open(output_path, "a") as f:
+            summary = {
+                "type": "summary",
+                "successful": successful,
+                "failed": failed,
+                "total": len(samples),
+                "avg_latency_ms": avg_latency,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+            }
+            f.write(json.dumps(summary) + "\n")
 
     logger.info(f"Completed: {successful}/{len(samples)} successful, avg latency: {avg_latency:.0f}ms")
     logger.info(f"Results saved to: {output_path}")
