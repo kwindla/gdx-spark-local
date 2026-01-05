@@ -1,21 +1,19 @@
-# Nemotron-Speech
+# Voice Agent With NVIDIA Open Models
 
-Local voice agent infrastructure for NVIDIA DGX Spark or RTX 5090. Runs ASR, TTS, and LLM entirely on-device in a unified container.
+[![Demo Video](https://img.youtube.com/vi/8Fkz2PC54BI/maxresdefault.jpg)](https://www.youtube.com/watch?v=8Fkz2PC54BI)
 
-Uses three NVIDIA open weights models, with streaming and interleaved LLM and TTS chunking, with the goal of fast conversational response. Voice-to-voice inference latency from the time the user stops speaking to the time the bot starts speaking is 800-1200ms on DGX Spark with Nemotron-3-Nano Q8, and 500-800ms on RTX 5090 with Nemotron-3-Nano Q4.
+This repo is sample code for building voice agents with three NVIDIA open source models:
+  - Nemotron Speech ASR
+  - Nemotron 3 Nano LLM
+  - Magpie TTS (Preview)
 
-## Architecture
+Run locally on an NVIDIA DGX Spark or RTX 5090. Or deploy to the cloud with Modal and Pipecat Cloud.
 
-```
-Host: uv run pipecat_bots/bot_interleaved_streaming.py
-  ├── ASR:  ws://localhost:8080   (Parakeet 600M Pipecat WebSocket)
-  ├── LLM:  http://localhost:8000 (llama.cpp, Nemotron-3-Nano Q8)
-  └── TTS:  ws://localhost:8001   (Magpie 357M Pipecat WebSocket)
-```
+Accompanying blog posts:
+- [Nemotron Speech ASR Open Source Model Launch Post](https://huggingface.co/blog/nvidia/nemotron-speech-asr-scaling-voice-agents)
+- [More About Voice Agent Architectures and This Agent's Design]()
 
-Detailed architecture notes are in [docs/streaming-pipeline-architecture.md](docs/streaming-pipeline-architecture.md).
-
-## Quick Start
+## Quick start - run everything locally (DGX Spark or RTX 5090)
 
 ### 1. Build the Unified Container
 
@@ -36,9 +34,6 @@ Build time: 2-3 hours (builds PyTorch, NeMo, vLLM, llama.cpp from source for CUD
 
 # Start with vLLM instead of llama.cpp (requires ~72GB VRAM)
 ./scripts/nemotron.sh start --mode vllm
-
-# Start ASR + TTS only (no LLM)
-./scripts/nemotron.sh start --no-llm
 ```
 
 **Note**: Set `HUGGINGFACE_ACCESS_TOKEN` environment variable for gated model access.
@@ -51,56 +46,23 @@ uv run pipecat_bots/bot_interleaved_streaming.py
 
 Open `http://localhost:7860/client` in your browser.
 
+## Quick start - deploy to the cloud
+
+### Model deployment to Modal
+
+### Bot deployment to Pipecat Cloud
+
+*** Jon to fill in? ***
+
 ## Bot Variants
 
 Three bot implementations are available:
 
 | Bot | Description | Use Case |
 |-----|-------------|----------|
-| `bot_interleaved_streaming.py` | Chunked LLM + adaptive TTS + SmartTurn | **Production** - lowest latency |
-| `bot_simple_vad.py` | Same as above, but simple VAD (no SmartTurn) | Testing ASR accuracy |
-| `bot_vllm.py` | vLLM + batch TTS + SmartTurn | Higher quality inference (~72GB VRAM) |
-
-### bot_interleaved_streaming.py (Recommended)
-
-Production bot with interleaved streaming for lowest latency:
-- **LLM**: `LlamaCppChunkedLLMService` - sentence-boundary streaming
-- **TTS**: `MagpieWebSocketTTSService` - adaptive mode (streaming first chunk, batch after)
-- **VAD**: SmartTurn analyzer with 340ms silence threshold
-
-```bash
-uv run pipecat_bots/bot_interleaved_streaming.py            # SmallWebRTC transport
-uv run pipecat_bots/bot_interleaved_streaming.py -t daily   # Daily WebRTC transport
-```
-
-### bot_simple_vad.py
-
-Testing/debugging bot without Smart Turn:
-- Same services as `bot_interleaved_streaming.py`
-- Uses simple Silero VAD with 800ms silence threshold
-
-
-```bash
-uv run pipecat_bots/bot_simple_vad.py
-```
-
-### bot_vllm.py
-
-LLM inference with vLLM, supports full BF16 Nemotron 3 Nanoweights:
-- **LLM**: `OpenAILLMService` - vLLM with full BF16 weights
-- **TTS**: `MagpieWebSocketTTSService` - batch mode
-- **VAD**: SmartTurn analyzer with 340ms silence threshold
-- Requires ~72GB VRAM (vs ~32GB for llama.cpp Q8)
-
-```bash
-# Start container in vLLM mode
-./scripts/nemotron.sh start --mode vllm
-
-# Run the bot
-uv run pipecat_bots/bot_vllm.py
-```
-
-## Environment Variables
+| `bot_interleaved_streaming.py` | Chunked LLM + adaptive TTS + SmartTurn | Optimized for voice-to-voice latency on a single GPU |
+| `bot_simple_vad.py` | Same as above, but simple VAD (no SmartTurn) | For some use cases, VAD with a fixed silence window is sufficient |
+| `bot_vllm.py` | vLLM + batch TTS + SmartTurn | For production multi-GPU cloud deployment, standard "stream all the tokens" pipeline |
 
 ### bot_interleaved_streaming.py / bot_simple_vad.py
 
@@ -129,44 +91,6 @@ Custom services in `pipecat_bots/`:
 | `LlamaCppChunkedLLMService` | `llama_cpp_chunked_llm.py` | Sentence-boundary chunking, two-slot alternation with 2s reuse guard |
 | `MagpieWebSocketTTSService` | `magpie_websocket_tts.py` | Adaptive streaming (fast TTFB first chunk, batch quality after) |
 | `NVidiaWebSocketSTTService` | `nvidia_stt.py` | Real-time streaming ASR |
-
-### Key Features
-
-**Chunked LLM** (`bot_interleaved_streaming.py`, `bot_simple_vad.py`):
-- Generates responses in sentence-boundary chunks for natural TTS
-- Two-slot alternation prevents llama.cpp race condition crashes
-- 2-second reuse guard ensures slot cleanup completes
-
-**WebSocket TTS** (all bots):
-- Adaptive mode: streaming for first segment (~370ms TTFB), batch for subsequent (quality)
-- Generation counter discards stale audio after interruptions
-- Cancel message immediately stops server generation
-
-## Server-Side Services
-
-### TTS Server (`src/nemotron_speech/tts_server.py`)
-
-WebSocket endpoint at `/ws/tts/stream`:
-
-| Message | Direction | Description |
-|---------|-----------|-------------|
-| `{"type": "init", "voice": "aria", "language": "en"}` | Client | Initialize stream |
-| `{"type": "text", "text": "...", "mode": "stream\|batch"}` | Client | Send text for synthesis |
-| `{"type": "close"}` | Client | Flush remaining text, complete stream |
-| `{"type": "cancel"}` | Client | Immediately stop generation |
-| Binary audio | Server | PCM audio (22kHz, 16-bit, mono) |
-| `{"type": "segment_complete"}` | Server | Segment done, more may follow |
-| `{"type": "done"}` | Server | Stream complete |
-
-### ASR Server (`src/nemotron_speech/server.py`)
-
-WebSocket endpoint at `ws://localhost:8080`:
-
-| Message | Direction | Description |
-|---------|-----------|-------------|
-| `{"type": "ready"}` | Server | Ready to receive audio |
-| Binary audio | Client | PCM audio (16kHz, 16-bit, mono) |
-| `{"type": "transcript", "text": "...", "is_final": bool}` | Server | Transcription result |
 
 ## Container Management
 
@@ -387,6 +311,3 @@ The pause happens *after* the audio plays, not before, preserving low TTFB.
 **vLLM DNS resolution issues**:
 - The container uses `--network=host` in vLLM mode to avoid DNS issues with HuggingFace
 
-## License
-
-MIT
