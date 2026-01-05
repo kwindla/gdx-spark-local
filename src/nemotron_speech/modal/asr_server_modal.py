@@ -9,8 +9,6 @@ Usage:
     # Test locally
     python -m src.nemotron_speech.modal.asr_server_modal
 
-Environment:
-    Model weights expected in Modal volume at /model/Parakeet_Reatime_En_600M.nemo
 """
 
 import asyncio
@@ -28,8 +26,9 @@ app = modal.App("nemotron-asr-server")
 
 # Model cache volume
 model_cache = modal.Volume.from_name("nemotron-speech", create_if_missing=True)
-CACHE_PATH = "/model"
-MODEL_PATH = "/model/Parakeet_Reatime_En_600M.nemo"
+CACHE_PATH = "/cache"
+
+MODEL_NAME = "nvidia/nemotron-speech-streaming-en-0.6b"
 
 # Define the container image
 image = (
@@ -41,6 +40,8 @@ image = (
     })
     .apt_install("git", "libsndfile1", "ffmpeg")
     .uv_pip_install(
+         "hf_transfer==0.1.9",
+        "huggingface_hub[hf-xet]==0.31.2",
         "numpy<2.0.0",
         "torch",
         "aiohttp",
@@ -54,7 +55,11 @@ image = (
     ).uv_pip_install(
         "nemo_toolkit[asr]@git+https://github.com/NVIDIA/NeMo.git@644201898480ec8c8d0a637f0c773825509ac4dc",
         extra_options="--no-cache",
-    )
+    ).env({
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "HF_HOME": CACHE_PATH,
+        "TORCH_HOME": CACHE_PATH,
+    })
 )
 
 # Enable debug logging with DEBUG_ASR=1
@@ -142,10 +147,10 @@ class NemotronASRModel:
         """Load model on container startup."""
         
         
-        logger.info(f"Loading ASR model from {MODEL_PATH}...")
+        logger.info(f"Loading ASR model from {MODEL_NAME}...")
         
-        self.model = nemo_asr.models.ASRModel.restore_from(
-            MODEL_PATH, map_location='cpu'
+        self.model = nemo_asr.models.ASRModel.from_pretrained(
+            MODEL_NAME
         )
         self.model = self.model.cuda()
         
