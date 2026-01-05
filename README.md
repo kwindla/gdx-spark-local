@@ -52,7 +52,90 @@ Open `http://localhost:7860/client` in your browser.
 
 ### Bot deployment to Pipecat Cloud
 
-*** Jon to fill in? ***
+> [!NOTE]
+> Sign up for a [Pipecat Cloud](https://docs.pipecat.ai/deployment/pipecat-cloud/introduction) account [here](https://pipecat.daily.co/)
+
+#### 1. Login to your Pipecat Cloud account using the CLI
+
+```bash
+pipecat cloud auth login
+```
+
+#### 2. Create a new secret set with the necessary API keys
+
+```bash
+pipecat cloud secrets set gdx-spark-bot-secrets \
+  NVIDIA_ASR_URL=wss://abc \
+  NVIDIA_LLM_URL=https://abc \
+  NVIDIA_TTS_URL=wss://abc
+```
+
+_Alternatively, create your secret set from a `.env` file:_
+
+```bash
+pipecat cloud secrets set gdx-spark-bot-secrets --file .env
+```
+
+#### 3. Create image pull secret
+
+Image pull secrets are used to authenticate with private Docker registries when deploying agents. [See docs](https://docs.pipecat.ai/deployment/pipecat-cloud/fundamentals/secrets#image-pull-secrets).
+
+```bash
+pipecat cloud secrets image-pull-secret gdx-spark-bot-pull-secret https://index.docker.io/v1/
+```
+
+#### Optional: Create a PCC Deploy toml 
+
+To speed up deployment, create a `pcc-deploy.toml` in `/pipecat_bots`. This file is read by the Pipecat CLI to prefill common commands:
+
+```bash
+agent_name = "gdx-spark-bot"
+image = "your-docker-repository/gdx-spark-bot:latest"
+secret_set = "gdx-spark-bot-secrets"
+image_credentials = "gdx-spark-bot-pull-secret"
+agent_profile = "agent-1x"
+
+[scaling]
+	min_agents = 0
+	max_agents = 5
+```
+
+#### 5. Build and push Docker image
+
+```bash
+docker build -f pipecat_bots/Dockerfile -t gdx-spark-bot:latest .
+docker tag gdx-spark-bot:latest your-docker-repository/gdx-spark-bot:latest
+docker push your-docker-repository/gdx-spark-bot:latest
+```
+
+#### 6. Deploy bot
+
+Run deploy command and follow prompts
+
+```bash
+pipecat cloud deploy
+
+# ...or if not using pcc-deploy.toml
+
+pipecat cloud deploy gdx-spark-bot your-docker-repository/gdx-spark-bot:latest \
+--credentials gdx-spark-bot-pull-secret \
+--secrets gdx-spark-bot-secrets \
+--profile agent-1x
+```
+
+#### 7. Start bot using CLI
+
+Create a public access key for Pipecat Cloud. Set this is a the default key when prompted.
+
+```bash
+pipecat cloud organizations keys create
+```
+
+Start an active session with your deployed bot. [See docs](https://docs.pipecat.ai/deployment/pipecat-cloud/fundamentals/active-sessions) for REST and Python usage.
+
+```bash
+pipecat cloud start gdx-spark-bot --use-daily
+```
 
 ## Bot Variants
 
