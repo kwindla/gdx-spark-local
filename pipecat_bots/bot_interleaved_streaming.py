@@ -191,8 +191,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 "Your goal is to have a natural conversation with the user. "
                 "Keep your responses concise and conversational since they will be spoken aloud. "
                 "Avoid special characters. Use only simple, plain text sentences. "
-                "Always punctuate your responses using standard sentence punctuation: commas, periods, question marks, exclamation points, etc."
-                "Always spell out numbers as words."
+                "Always punctuate your responses using standard sentence punctuation: commas, periods, question marks, exclamation points, etc. "
+                "Always spell out numbers as words. "
             ),
         },
         {

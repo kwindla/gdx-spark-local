@@ -41,7 +41,7 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.tts_service import WebsocketTTSService
 
 # Import the continue frame for LLM/TTS synchronization
-from .frames import ChunkedLLMContinueGenerationFrame
+from frames import ChunkedLLMContinueGenerationFrame
 
 try:
     from websockets.asyncio.client import connect as websocket_connect
