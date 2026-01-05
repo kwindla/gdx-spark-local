@@ -111,8 +111,8 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
                 self._pending_frame_direction
             )
             self._pending_user_stopped_frame = None
-        # Send final reset to ensure any buffered audio is transcribed
-        await self._send_reset()
+        # Send HARD reset to ensure any buffered audio is transcribed
+        await self._send_reset(finalize=True)
         await super().stop(frame)
         await self._disconnect()
 
@@ -126,6 +126,19 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         await self._cancel_pending_frame_timeout()
         self._pending_user_stopped_frame = None
         self._waiting_for_final = False
+        # Send HARD reset to capture any remaining buffered audio
+        # This ensures words at the end of audio aren't lost when pipeline is cancelled
+        await self._send_reset(finalize=True)
+        # Wait briefly for server to process the reset and send response
+        # Without this, we disconnect before receiving the final transcript
+        if self._websocket and self._ready:
+            try:
+                msg = await asyncio.wait_for(self._websocket.recv(), timeout=0.5)
+                data = json.loads(msg)
+                if data.get("type") == "transcript" and data.get("is_final"):
+                    await self._handle_transcript(data)
+            except (asyncio.TimeoutError, Exception):
+                pass  # Best effort - don't block cancel on network issues
         await super().cancel(frame)
         await self._disconnect()
 
@@ -168,14 +181,17 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
             await super().process_frame(frame, direction)
             return
 
-        # Handle UserStoppedSpeakingFrame - hold it if waiting for final transcript
+        # Handle UserStoppedSpeakingFrame - hold it and send hard reset
         if isinstance(frame, UserStoppedSpeakingFrame):
             if self._waiting_for_final:
-                # Hold this frame until final transcript arrives
+                # Hold this frame until final transcript arrives from hard reset
                 self._pending_user_stopped_frame = frame
                 self._pending_frame_direction = direction
                 self._start_pending_frame_timeout()
                 logger.debug(f"{self} holding UserStoppedSpeakingFrame at {time.time():.3f}")
+                # Send HARD reset to capture trailing words like "and" in "speaker and"
+                # Hard reset uses padding + keep_all_outputs=True, then resets decoder
+                await self._send_reset(finalize=True)
                 return  # Don't pass through yet
             # If not waiting for final, pass through normally
             await super().process_frame(frame, direction)
@@ -184,16 +200,23 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         # All other frames pass through normally
         await super().process_frame(frame, direction)
 
-        # Trigger transcript finalization on VAD silence detection.
+        # Trigger SOFT reset on VAD silence detection.
         # VAD fires after ~200ms of silence, so all speech audio has already
-        # been sent. The server adds 480ms silence padding for trailing context.
+        # been sent. Soft reset returns current text quickly without forcing
+        # decoder finalization (no keep_all_outputs=True), preserving decoder state.
         if isinstance(frame, VADUserStoppedSpeakingFrame):
             self._waiting_for_final = True
             self._vad_stopped_time = time.time()  # Start STT metric timer
-            await self._send_reset()
+            await self._send_reset(finalize=False)  # Soft reset
 
-    async def _send_reset(self):
-        """Send reset signal to trigger final transcription.
+    async def _send_reset(self, finalize: bool = True):
+        """Send reset signal to trigger transcription.
+
+        Args:
+            finalize: If True (hard reset), server adds padding and uses
+                      keep_all_outputs=True to capture trailing words.
+                      If False (soft reset), server returns current text
+                      without forcing decoder output.
 
         Acquires audio_send_lock to ensure any in-progress audio send completes
         before the reset signal is sent.
@@ -201,12 +224,17 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         if self._websocket and self._ready:
             try:
                 async with self._audio_send_lock:
-                    await self._websocket.send(json.dumps({"type": "reset"}))
+                    await self._websocket.send(json.dumps({
+                        "type": "reset",
+                        "finalize": finalize
+                    }))
                     # Log inside lock to get accurate byte count
                     samples = self._audio_bytes_sent // 2
                     duration_ms = (samples * 1000) // 16000
-                    logger.debug(f"{self} sent reset (audio: {duration_ms}ms)")
-                    self._audio_bytes_sent = 0
+                    reset_type = "hard" if finalize else "soft"
+                    logger.debug(f"{self} sent {reset_type} reset (audio: {duration_ms}ms)")
+                    if finalize:
+                        self._audio_bytes_sent = 0  # Only reset on hard reset
             except Exception as e:
                 logger.error(f"{self} failed to send reset: {e}")
 
@@ -363,17 +391,27 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
     async def _handle_transcript(self, data: dict):
         """Handle a transcript message from the server.
 
-        For final transcripts, releases any pending UserStoppedSpeakingFrame
-        AFTER pushing the transcript. This ensures correct frame ordering at
-        the aggregator, preventing the 500ms timeout.
+        For final transcripts from HARD resets (finalize=True), releases any
+        pending UserStoppedSpeakingFrame AFTER pushing the transcript. This
+        ensures correct frame ordering at the aggregator, preventing the 500ms
+        timeout.
+
+        For SOFT resets (finalize=False), we push the transcript but don't
+        release the pending frame - we're still waiting for the hard reset
+        response that will have the complete text including trailing words.
 
         Args:
             data: The transcript message data.
         """
         text = data.get("text", "")
         is_final = data.get("is_final", False)
+        is_hard_reset = data.get("finalize", True)  # Default True for backward compat
 
         if not text:
+            # Even with empty text, release pending frame on hard reset
+            if is_final and is_hard_reset:
+                logger.debug(f"{self} hard reset with empty text, releasing pending frame")
+                await self._release_pending_frame()
             return
 
         await self.stop_ttfb_metrics()
@@ -381,35 +419,49 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         timestamp = time_now_iso8601()
 
         if is_final:
-            logger.debug(f"{self} final transcript at {time.time():.3f}: {text[:50]}...")
-            # Push transcript first
-            await self.push_frame(
-                TranscriptionFrame(
-                    text,
-                    self._user_id,
-                    timestamp,
-                    language=None,
-                )
-            )
-            await self.stop_processing_metrics()
+            # Only emit TranscriptionFrames from HARD reset responses.
+            # Soft reset returns partial/stable text quickly but may have incomplete
+            # words (e.g., "shipp" instead of "shipping"). Hard reset adds padding
+            # and uses keep_all_outputs=True to get complete words.
+            #
+            # Soft reset is still useful for timing - it triggers quickly after VAD
+            # and allows the pipeline to know speech has stopped. But we don't emit
+            # the transcript until hard reset confirms the complete text.
 
-            # Emit STT processing time metric
-            if self._vad_stopped_time is not None:
-                processing_time = time.time() - self._vad_stopped_time
-                logger.info(f"{self} NemotronSTT TTFB: {processing_time*1000:.0f}ms")
-                metrics_frame = MetricsFrame(
-                    data=[
-                        TTFBMetricsData(
-                            processor="NemotronSTT",
-                            value=processing_time,
+            reset_type = "hard" if is_hard_reset else "soft"
+            logger.debug(f"{self} {reset_type} final at {time.time():.3f}: {text[-50:] if len(text) > 50 else text}")
+
+            if is_hard_reset:
+                # Server handles deduplication - it sends only the delta (new portion)
+                # so we emit directly without client-side deduplication
+                if text:
+                    await self.push_frame(
+                        TranscriptionFrame(
+                            text,
+                            self._user_id,
+                            timestamp,
+                            language=None,
                         )
-                    ]
-                )
-                await self.push_frame(metrics_frame)
-                self._vad_stopped_time = None
+                    )
+                    await self.stop_processing_metrics()
 
-            # Then release any pending UserStoppedSpeakingFrame
-            await self._release_pending_frame()
+                    # Emit STT processing time metric
+                    if self._vad_stopped_time is not None:
+                        processing_time = time.time() - self._vad_stopped_time
+                        logger.info(f"{self} NemotronSTT TTFB: {processing_time*1000:.0f}ms")
+                        metrics_frame = MetricsFrame(
+                            data=[
+                                TTFBMetricsData(
+                                    processor="NemotronSTT",
+                                    value=processing_time,
+                                )
+                            ]
+                        )
+                        await self.push_frame(metrics_frame)
+                        self._vad_stopped_time = None
+
+                # Release pending UserStoppedSpeakingFrame
+                await self._release_pending_frame()
         else:
             logger.trace(f"{self} interim: {text[:30]}...")
             await self.push_frame(

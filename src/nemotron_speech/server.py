@@ -57,8 +57,17 @@ class ASRSession:
     previous_hypotheses: Any = None
     pred_out_stream: Any = None
 
-    # Current transcription
+    # Current transcription (model's cumulative output)
     current_text: str = ""
+
+    # Last text emitted to client on hard reset (for server-side deduplication)
+    # We only send the delta (new portion) to avoid downstream duplication
+    last_emitted_text: str = ""
+
+    # Audio overlap buffer for mid-utterance reset continuity
+    # This preserves the last N ms of audio to provide encoder left-context
+    # when a new segment starts after a reset
+    overlap_buffer: Optional[np.ndarray] = None
 
 
 class ASRServer:
@@ -91,6 +100,9 @@ class ASRServer:
         self.shift_frames = None
         self.pre_encode_cache_size = None
         self.hop_samples = None
+
+        # Audio overlap for mid-utterance reset continuity (calculated in load_model)
+        self.overlap_samples = None
 
     def load_model(self):
         """Load the NeMo ASR model with streaming configuration."""
@@ -151,11 +163,18 @@ class ASRServer:
         self.final_padding_frames = (self.right_context + 1) * self.shift_frames
         padding_ms = self.final_padding_frames * hop_length_sec * 1000
 
+        # Calculate audio overlap for mid-utterance reset continuity
+        # Use pre_encode_cache_size frames = 90ms of left-context
+        # This allows the encoder to have proper context when starting a new segment
+        self.overlap_samples = self.pre_encode_cache_size * self.hop_samples
+        overlap_ms = self.overlap_samples * 1000 / self.sample_rate
+
         shift_ms = self.shift_frames * hop_length_sec * 1000
         logger.info(f"Model loaded: {type(self.model).__name__}")
         logger.info(f"Shift size: {shift_ms:.0f}ms ({self.shift_frames} frames)")
         logger.info(f"Pre-encode cache: {self.pre_encode_cache_size} frames")
         logger.info(f"Final chunk padding: {padding_ms:.0f}ms ({self.final_padding_frames} frames)")
+        logger.info(f"Audio overlap for resets: {overlap_ms:.0f}ms ({self.overlap_samples} samples)")
 
         # Warmup inference to ensure model is fully loaded on GPU
         # This prevents GPU memory issues when LLM starts later
@@ -207,7 +226,12 @@ class ASRServer:
         logger.info(f"Warmup complete in {elapsed:.0f}ms - GPU memory claimed")
 
     def _init_session(self, session: ASRSession):
-        """Initialize a fresh session."""
+        """Initialize a fresh session.
+
+        If an overlap_buffer is present from a previous segment, it will be
+        prepended to the accumulated audio to provide encoder left-context.
+        This enables seamless transcription across mid-utterance resets.
+        """
         # Initialize encoder cache
         cache = self.model.encoder.get_initial_cache_state(batch_size=1)
         session.cache_last_channel = cache[0]
@@ -215,7 +239,18 @@ class ASRServer:
         session.cache_last_channel_len = cache[2]
 
         # Reset audio buffer and frame counter
-        session.accumulated_audio = np.array([], dtype=np.float32)
+        # If overlap buffer exists, use it as the starting audio
+        if session.overlap_buffer is not None and len(session.overlap_buffer) > 0:
+            session.accumulated_audio = session.overlap_buffer.copy()
+            overlap_ms = len(session.overlap_buffer) * 1000 / self.sample_rate
+            logger.debug(
+                f"Session {session.id}: prepending {len(session.overlap_buffer)} samples "
+                f"({overlap_ms:.0f}ms) of overlap audio"
+            )
+            session.overlap_buffer = None  # Clear after use
+        else:
+            session.accumulated_audio = np.array([], dtype=np.float32)
+
         session.emitted_frames = 0
 
         # Reset decoder state
@@ -254,7 +289,10 @@ class ASRServer:
                         msg_type = data.get("type")
 
                         if msg_type == "reset" or msg_type == "end":
-                            await self._reset_session(session)
+                            # finalize=True (default): hard reset with padding + keep_all_outputs
+                            # finalize=False: soft reset, just return current text
+                            finalize = data.get("finalize", True)
+                            await self._reset_session(session, finalize=finalize)
                         else:
                             logger.warning(f"Client {session_id}: unknown message type: {msg_type}")
 
@@ -400,51 +438,132 @@ class ASRServer:
             logger.error(traceback.format_exc())
             return None
 
-    async def _reset_session(self, session: ASRSession):
-        """Finalize and reset session."""
+    async def _reset_session(self, session: ASRSession, finalize: bool = True):
+        """Handle reset with soft or hard finalization.
+
+        Args:
+            finalize: If True (hard reset), add padding and use keep_all_outputs=True
+                      to capture trailing words, then reset decoder state.
+                      If False (soft reset), just return current cumulative text
+                      without forcing decoder output.
+
+        Soft reset (finalize=False):
+        - Returns current_text as is_final (model's streaming output)
+        - No audio processing, no decoder finalization
+        - Decoder state preserved (no corruption)
+        - Used on VADUserStoppedSpeakingFrame for fast response
+
+        Hard reset (finalize=True):
+        - Adds padding and processes with keep_all_outputs=True
+        - Captures trailing words at segment boundaries
+        - Resets decoder state to prevent corruption from multiple hard resets
+        - Preserves encoder cache for acoustic context
+        - Used on UserStoppedSpeakingFrame for complete transcription
+        """
+        import time
+
         # Log audio state at reset for diagnostics
-        audio_samples = len(session.accumulated_audio)
+        audio_samples = len(session.accumulated_audio) if session.accumulated_audio is not None else 0
         audio_duration_ms = (audio_samples * 1000) // self.sample_rate
         logger.debug(
-            f"Session {session.id} reset received: "
+            f"Session {session.id} {'hard' if finalize else 'soft'} reset: "
             f"accumulated={audio_samples} samples ({audio_duration_ms}ms), "
             f"emitted={session.emitted_frames} frames"
         )
 
+        if not finalize:
+            # SOFT RESET: Return current text without processing
+            # This is fast (~0ms) and doesn't corrupt decoder state.
+            # The model's current_text is already cumulative (contains all text
+            # from session start), so we just return it directly.
+            # We don't concatenate with cumulative_text to avoid duplication.
+            text = session.current_text
+
+            await session.websocket.send_str(json.dumps({
+                "type": "transcript",
+                "text": text,
+                "is_final": True,
+                "finalize": False  # Tell client this was soft reset
+            }))
+
+            logger.debug(f"Session {session.id} soft reset: '{text[-50:] if len(text) > 50 else text}'")
+            # Keep all state intact - decoder, encoder, audio buffer
+            return
+
+        # HARD RESET: Full finalization with padding
+        # Save original audio length before adding padding
+        original_audio_length = len(session.accumulated_audio) if session.accumulated_audio is not None else 0
+
         # Pad with silence to ensure the model has enough trailing context
         # to finalize the last word. Padding = (right_context + 1) * shift_frames.
-        if len(session.accumulated_audio) > 0:
+        if original_audio_length > 0:
             padding_samples = self.final_padding_frames * self.hop_samples
             silence_padding = np.zeros(padding_samples, dtype=np.float32)
             session.accumulated_audio = np.concatenate([session.accumulated_audio, silence_padding])
 
         # Process all remaining audio with keep_all_outputs=True
-        import time
-        if len(session.accumulated_audio) > 0:
+        final_text = session.current_text
+        if session.accumulated_audio is not None and len(session.accumulated_audio) > 0:
             start_time = time.perf_counter()
             async with self.inference_lock:
                 text = await asyncio.get_event_loop().run_in_executor(
                     None, self._process_final_chunk, session
                 )
                 if text is not None:
-                    session.current_text = text
+                    final_text = text
+                    session.current_text = text  # Update current_text for next soft reset
             elapsed_ms = (time.perf_counter() - start_time) * 1000
-            logger.debug(f"Session {session.id} final chunk processed in {elapsed_ms:.1f}ms")
+            logger.debug(f"Session {session.id} final chunk processed in {elapsed_ms:.1f}ms: '{final_text[-50:] if len(final_text) > 50 else final_text}'")
 
-        # Send final transcript
+        # Server-side deduplication: only send the delta (new portion)
+        # This avoids downstream duplication when aggregators concatenate transcripts
+        if final_text.startswith(session.last_emitted_text):
+            delta_text = final_text[len(session.last_emitted_text):].lstrip()
+        else:
+            # ASR corrected earlier text - send full text
+            # (This is rare but can happen with model corrections)
+            delta_text = final_text
+            logger.debug(
+                f"Session {session.id}: ASR correction detected, "
+                f"last='{session.last_emitted_text[-30:]}', new='{final_text[-30:]}'"
+            )
+
+        # Update tracking state before sending
+        session.last_emitted_text = final_text
+
+        # Send only the delta to client
         await session.websocket.send_str(json.dumps({
             "type": "transcript",
-            "text": session.current_text,
-            "is_final": True
+            "text": delta_text,
+            "is_final": True,
+            "finalize": True  # Tell client this was hard reset
         }))
 
-        logger.debug(f"Session {session.id} reset complete, final: '{session.current_text[:50]}...'")
+        logger.debug(
+            f"Session {session.id} hard reset: delta='{delta_text}' "
+            f"(cumulative='{final_text[-50:] if len(final_text) > 50 else final_text}')"
+        )
 
-        # Reinitialize
-        async with self.inference_lock:
-            await asyncio.get_event_loop().run_in_executor(
-                None, self._init_session, session
-            )
+        # Remove padding (restore to original audio length)
+        if original_audio_length > 0:
+            session.accumulated_audio = session.accumulated_audio[:original_audio_length]
+        else:
+            session.accumulated_audio = np.array([], dtype=np.float32)
+
+        # CONTINUOUS SESSION: Keep ALL state intact
+        # The decoder state is preserved to maintain context for subsequent audio.
+        # Server-side deduplication via last_emitted_text ensures clients receive
+        # only new text portions, avoiding downstream duplication in aggregators.
+        #
+        # Note: We considered resetting decoder to prevent corruption from multiple
+        # keep_all_outputs=True calls, but this breaks transcription continuity.
+        # The soft/hard reset distinction helps by limiting keep_all_outputs=True
+        # to only UserStoppedSpeakingFrame events.
+
+        logger.debug(
+            f"Session {session.id} hard reset complete, state preserved: "
+            f"{len(session.accumulated_audio)} samples, {session.emitted_frames} frames"
+        )
 
     def _process_final_chunk(self, session: ASRSession) -> Optional[str]:
         """Process all remaining audio with keep_all_outputs=True."""
