@@ -42,21 +42,21 @@ from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
 # Import our custom local services
-from nvidia_stt import NVidiaWebSocketSTTService
-from magpie_websocket_tts import MagpieWebSocketTTSService
-from v2v_metrics import V2VMetricsProcessor
+from .nvidia_stt import NVidiaWebSocketSTTService
+from .magpie_websocket_tts import MagpieWebSocketTTSService
+from .v2v_metrics import V2VMetricsProcessor
 
 load_dotenv(override=True)
 
 # Configuration from environment
-NVIDIA_ASR_URL = os.getenv("NVIDIA_ASR_URL", "ws://localhost:8080")
-NVIDIA_LLM_URL = os.getenv("NVIDIA_LLM_URL", "http://localhost:8000/v1")
+NVIDIA_ASR_URL = os.getenv("NVIDIA_ASR_URL", "wss://modal-labs-shababo-dev--nemotron-asr-server-nemotronasrm-e20a18.modal.run")
+NVIDIA_LLM_URL = os.getenv("NVIDIA_LLM_URL", "https://modal-labs-shababo-dev--example-vllm-inference-serve.modal.run/v1")
 NVIDIA_LLM_MODEL = os.getenv(
     "NVIDIA_LLM_MODEL",
-    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
 )
 NVIDIA_LLM_API_KEY = os.getenv("NVIDIA_LLM_API_KEY", "not-needed")
-NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
+NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "https://modal-labs-shababo-dev--magpie-tts-server-magpiettsmodel-api.modal.run")
 
 # VAD configuration - used by both VAD analyzer and V2V metrics
 VAD_STOP_SECS = 0.2
@@ -164,7 +164,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             context_aggregator.user(),
             llm,
             tts,
-            v2v_metrics,
+            # v2v_metrics,
             transport.output(),
             context_aggregator.assistant(),
         ]
