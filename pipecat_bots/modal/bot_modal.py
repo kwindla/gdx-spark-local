@@ -47,17 +47,22 @@ from ..nvidia_stt import NVidiaWebSocketSTTService
 from ..magpie_websocket_tts import MagpieWebSocketTTSService
 from ..v2v_metrics import V2VMetricsProcessor
 
+import modal
+
 load_dotenv(override=True)
 
 # Configuration from environment
-NVIDIA_ASR_URL = os.getenv("NVIDIA_ASR_URL", "wss://modal-labs-shababo-dev--nemotron-asr-server-nemotronasrm-e20a18.modal.run")
-NVIDIA_LLM_URL = os.getenv("NVIDIA_LLM_URL", "https://modal-labs-shababo-dev--nemotron-nano-vllm-serve.modal.run/v1")
+asr_instance = modal.Cls.from_name("nemotron-asr-server", "NemotronASRModel")()
+NVIDIA_ASR_URL = os.getenv("NVIDIA_ASR_URL", asr_instance.api.get_web_url().replace("https://", "wss://"))
+llm_instance = modal.Function.from_name("nemotron-nano-vllm", "serve")
+NVIDIA_LLM_URL = os.getenv("NVIDIA_LLM_URL", llm_instance.get_web_url() + "/v1")
 NVIDIA_LLM_MODEL = os.getenv(
     "NVIDIA_LLM_MODEL",
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 )
 NVIDIA_LLM_API_KEY = os.getenv("NVIDIA_LLM_API_KEY", "not-needed")
-NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "https://modal-labs-shababo-dev--magpie-tts-server-magpiettsmodel-api.modal.run")
+tts_instance = modal.Cls.from_name("magpie-tts-server", "MagpieTTSModel")()
+NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", tts_instance.api.get_web_url())
 
 # VAD configuration - used by both VAD analyzer and V2V metrics
 VAD_STOP_SECS = 0.2
