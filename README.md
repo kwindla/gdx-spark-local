@@ -48,9 +48,11 @@ Open `http://localhost:7860/client` in your browser.
 
 ## Quick start - deploy to the cloud with Modal
 
-### Prerequisites
+### 1. Prerequisites
 
-Create a [Modal](modal.com) account if you don't have one.
+Create a [Modal](modal.com) account if you don't have one. 
+
+Then, install the necessary dependencies using `uv` with optional dependency group `modal` and authenticate your account.
 
 ```bash
 # Authenticate with Modal
