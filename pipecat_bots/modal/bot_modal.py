@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 #
-# Pipecat bot using vLLM for higher quality inference.
+# Pipecat bot using Modal deployed AI services. Similar to bot_vllm.py, but uses Modal deployed services instead of local services.
 #
-# Uses vLLM (OpenAI-compatible API) instead of llama.cpp. Requires more VRAM (~72GB)
-# but provides higher quality inference with full BF16 weights.
 #
-# Environment variables:
-#   NVIDIA_ASR_URL        ASR WebSocket URL (default: ws://localhost:8080)
-#   NVIDIA_LLM_URL        vLLM API URL (default: http://localhost:8000/v1)
+# Optional nvironment variables. URLs default to querying Modal deployments for endpoints.
+#   NVIDIA_ASR_URL        ASR WebSocket URL 
+#   NVIDIA_LLM_URL        vLLM API URL 
 #   NVIDIA_LLM_MODEL      Model name/path (default: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
 #   NVIDIA_LLM_API_KEY    API key for vLLM (default: not-needed)
-#   NVIDIA_TTS_URL        Magpie TTS server URL (default: http://localhost:8001)
+#   NVIDIA_TTS_URL        Magpie TTS server URL 
 #
 # Usage:
-#   uv run pipecat_bots/bot_vllm.py
-#   uv run pipecat_bots/bot_vllm.py -t daily
-#   uv run pipecat_bots/bot_vllm.py -t webrtc
+#   uv run pipecat_bots/bot_modal.py
+#   uv run pipecat_bots/bot_modal.py -t daily
+#   uv run pipecat_bots/bot_modal.py -t webrtc
 #
 
 import os
@@ -43,21 +41,26 @@ from pipecat.transports.daily.transport import DailyParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
 # Import our custom local services
-from nvidia_stt import NVidiaWebSocketSTTService
-from magpie_websocket_tts import MagpieWebSocketTTSService
-from v2v_metrics import V2VMetricsProcessor
+from ..nvidia_stt import NVidiaWebSocketSTTService
+from ..magpie_websocket_tts import MagpieWebSocketTTSService
+from ..v2v_metrics import V2VMetricsProcessor
+
+import modal
 
 load_dotenv(override=True)
 
 # Configuration from environment
-NVIDIA_ASR_URL = os.getenv("NVIDIA_ASR_URL", "ws://localhost:8080")
-NVIDIA_LLM_URL = os.getenv("NVIDIA_LLM_URL", "http://localhost:8000/v1")
+asr_instance = modal.Cls.from_name("nemotron-asr-server", "NemotronASRModel")()
+NVIDIA_ASR_URL = os.getenv("NVIDIA_ASR_URL", asr_instance.api.get_web_url().replace("https://", "wss://"))
+llm_instance = modal.Function.from_name("nemotron-nano-vllm", "serve")
+NVIDIA_LLM_URL = os.getenv("NVIDIA_LLM_URL", llm_instance.get_web_url() + "/v1")
 NVIDIA_LLM_MODEL = os.getenv(
     "NVIDIA_LLM_MODEL",
     "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
 )
 NVIDIA_LLM_API_KEY = os.getenv("NVIDIA_LLM_API_KEY", "not-needed")
-NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", "http://localhost:8001")
+tts_instance = modal.Cls.from_name("magpie-tts-server", "MagpieTTSModel")()
+NVIDIA_TTS_URL = os.getenv("NVIDIA_TTS_URL", tts_instance.api.get_web_url())
 
 # VAD configuration - used by both VAD analyzer and V2V metrics
 VAD_STOP_SECS = 0.2

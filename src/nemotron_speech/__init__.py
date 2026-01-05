@@ -2,6 +2,4 @@
 
 __version__ = "0.1.0"
 
-from nemotron_speech.stt_service import NemotronSTTService
-
-__all__ = ["NemotronSTTService", "__version__"]
+__all__ = ["__version__"]

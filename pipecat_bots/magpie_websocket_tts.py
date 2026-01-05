@@ -41,7 +41,7 @@ from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.tts_service import WebsocketTTSService
 
 # Import the continue frame for LLM/TTS synchronization
-from frames import ChunkedLLMContinueGenerationFrame
+from .frames import ChunkedLLMContinueGenerationFrame
 
 try:
     from websockets.asyncio.client import connect as websocket_connect
@@ -507,6 +507,7 @@ class MagpieWebSocketTTSService(WebsocketTTSService):
             TTSStartedFrame on first token, then None.
         """
         # Sanitize text (remove emojis, normalize quotes/dashes)
+        logger.debug(f"MagpieWebSocketTTS: run_tts before sanitize_text_for_tts [{text}]")
         text = sanitize_text_for_tts(text)
 
         logger.debug(f"MagpieWebSocketTTS: run_tts [{text}]")
