@@ -13,7 +13,7 @@ Accompanying blog posts:
 - [Nemotron Speech ASR Open Source Model Launch Post](https://huggingface.co/blog/nvidia/nemotron-speech-asr-scaling-voice-agents)
 - [More About Voice Agent Architectures and This Agent's Design]()
 
-## Quick start - run everything locally (DGX Spark or RTX 5090)
+## Quick start - Run everything locally (DGX Spark or RTX 5090)
 
 ### 1. Build the Unified Container
 
@@ -46,20 +46,25 @@ uv run pipecat_bots/bot_interleaved_streaming.py
 
 Open `http://localhost:7860/client` in your browser.
 
-## Quick start - deploy to the cloud with Modal
+## Quick start - Deploy to Cloud with Modal and Pipecat Cloud
 
-### 1. Prerequisites
+### Modal (Services)
+
+#### 1. Prerequisites
 
 Create a [Modal](modal.com) account if you don't have one. 
 
 Then, install the necessary dependencies using `uv` with optional dependency group `modal` and authenticate your account.
 
 ```bash
+# Install Modal dependency
+uv sync --group modal
+
 # Authenticate with Modal
 modal setup
 ```
 
-### Deploy Services to Modal
+#### 2. Deploy Services to Modal
 
 ```bash
 # Deploy ASR service
@@ -74,10 +79,108 @@ modal deploy -m src.nemotron_speech.modal.vllm_modal
 
 The ASR deployment takes about 30 seconds to cold-start, 60 seconds for TTS, and about 3 minutes for vLLM. You can uncomment the `min_containers = 1` input to the Modal `Function` and `Cls` decorators to ensure that bots can start up quickly for production or development.
 
-### Run the bot locally or using Pipecat Cloud
+#### 3. Run the bot locally or using Pipecat Cloud
+
 ```bash
 uv run -m pipecat_bots.modal.bot_modal
 ```
+
+### Pipecat Cloud (Bot)
+
+> [!NOTE]
+> Sign up for a [Pipecat Cloud](https://docs.pipecat.ai/deployment/pipecat-cloud/introduction) account [here](https://pipecat.daily.co/)
+
+#### 1. Login to your Pipecat Cloud account using the CLI
+
+```bash
+# Install Pipecat Cloud package
+uv sync --group bot
+
+# Login
+pipecat cloud auth login
+```
+
+#### 2. Create a new secret set with the necessary API keys
+
+```bash
+pipecat cloud secrets set gdx-spark-bot-secrets \
+  NVIDIA_ASR_URL=wss:// \
+  NVIDIA_LLM_URL=https:// \
+  NVIDIA_TTS_URL=wss://
+```
+
+_Alternatively, create your secret set from a `.env` file:_
+
+```bash
+pipecat cloud secrets set gdx-spark-bot-secrets --file .env
+```
+
+#### 3. Create image pull secret
+
+Image pull secrets are used to authenticate with private Docker registries when deploying agents. [See docs](https://docs.pipecat.ai/deployment/pipecat-cloud/fundamentals/secrets#image-pull-secrets).
+
+```bash
+pipecat cloud secrets image-pull-secret gdx-spark-bot-pull-secret https://index.docker.io/v1/
+```
+
+___Optional: Create a PCC deploy toml___:
+
+To speed up deployment you can create a `pcc-deploy.toml` in the project root. This file is read by the Pipecat CLI to pre-fill command arguments:
+
+```bash
+agent_name = "gdx-spark-bot"
+image = "your-docker-repository/gdx-spark-bot:latest"
+secret_set = "gdx-spark-bot-secrets"
+image_credentials = "gdx-spark-bot-pull-secret"
+agent_profile = "agent-1x"
+
+[scaling]
+	min_agents = 1
+```
+
+#### 4. Build and push Docker image
+
+```bash
+docker build -f Dockerfile.bot -t gdx-spark-bot:latest .
+
+# Optional: tag image
+docker tag gdx-spark-bot:latest your-docker-repository/gdx-spark-bot:latest
+
+# Push to image repository e.g. Docker Hub
+docker push your-docker-repository/gdx-spark-bot:latest
+```
+
+#### 5. Deploy
+
+Run `deploy` command:
+
+```bash
+pipecat cloud deploy
+
+# ...or if not using pcc-deploy.toml
+
+pipecat cloud deploy gdx-spark-bot your-docker-repository/gdx-spark-bot:latest \
+--credentials gdx-spark-bot-pull-secret \
+--secrets gdx-spark-bot-secrets \
+--profile agent-1x
+```
+
+#### 6. Start bot using CLI
+
+Create a public access key for Pipecat Cloud. Set this is a the default key when prompted:
+
+```bash
+pipecat cloud organizations keys create
+```
+
+Start an active session with your deployed bot:
+
+```bash
+pipecat cloud agent start gdx-spark-bot --use-daily
+```
+
+[See docs](https://docs.pipecat.ai/deployment/pipecat-cloud/fundamentals/active-sessions) for REST and Python usage.
+
 
 ## Bot Variants
 
