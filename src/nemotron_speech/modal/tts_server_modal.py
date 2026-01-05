@@ -6,9 +6,6 @@ Usage:
     # Deploy to Modal
     modal deploy -m src.nemotron_speech.modal.tts_server_modal
 
-Environment:
-    Requires 'huggingface-secret' secret in Modal
-    Set up with: modal secret create huggingface-secret HF_TOKEN=hf_...
 """
 
 import asyncio
@@ -313,7 +310,6 @@ with image.imports():
         CACHE_PATH: model_cache,
     },
     gpu="A100",  # Use A100 GPU for fast inference
-    secrets=[modal.Secret.from_name("huggingface-secret")],  # HF token for model download
     timeout=3600,  # 1 hour timeout for long-running requests
     # min_containers = 1,
 )

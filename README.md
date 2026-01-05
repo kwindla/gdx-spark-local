@@ -57,13 +57,6 @@ Then, install the necessary dependencies using `uv` with optional dependency gro
 ```bash
 # Authenticate with Modal
 modal setup
-
-# Set HuggingFace token for gated model access (if necessary)
-modal secret create huggingface-secret HF_TOKEN=your_token_here
-
-# TEMP: upload the ASR model weights to a modal Volume
-modal volume create nemotron-speech
-modal volume put nemotron-speech /path/to/local/weights.nemo
 ```
 
 ### Deploy Services to Modal
