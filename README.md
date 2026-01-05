@@ -86,7 +86,7 @@ pipecat cloud secrets image-pull-secret gdx-spark-bot-pull-secret https://index.
 
 #### Optional: Create a PCC Deploy toml 
 
-To speed up deployment, create a `pcc-deploy.toml` in `/pipecat_bots`. This file is read by the Pipecat CLI to prefill common commands:
+To speed up deployment, create a `pcc-deploy.toml` in the project root. This file is read by the Pipecat CLI to pre-fill command arguments:
 
 ```bash
 agent_name = "gdx-spark-bot"
@@ -103,14 +103,14 @@ agent_profile = "agent-1x"
 #### 5. Build and push Docker image
 
 ```bash
-docker build -f pipecat_bots/Dockerfile -t gdx-spark-bot:latest .
+docker build -f pipecat_bots/Dockerfile.bot -t gdx-spark-bot:latest .
 docker tag gdx-spark-bot:latest your-docker-repository/gdx-spark-bot:latest
 docker push your-docker-repository/gdx-spark-bot:latest
 ```
 
 #### 6. Deploy bot
 
-Run deploy command and follow prompts
+Run `deploy` command:
 
 ```bash
 pipecat cloud deploy
@@ -125,17 +125,19 @@ pipecat cloud deploy gdx-spark-bot your-docker-repository/gdx-spark-bot:latest \
 
 #### 7. Start bot using CLI
 
-Create a public access key for Pipecat Cloud. Set this is a the default key when prompted.
+Create a public access key for Pipecat Cloud. Set this is a the default key when prompted:
 
 ```bash
 pipecat cloud organizations keys create
 ```
 
-Start an active session with your deployed bot. [See docs](https://docs.pipecat.ai/deployment/pipecat-cloud/fundamentals/active-sessions) for REST and Python usage.
+Start an active session with your deployed bot:
 
 ```bash
-pipecat cloud start gdx-spark-bot --use-daily
+pipecat cloud agent start gdx-spark-bot --use-daily
 ```
+
+[See docs](https://docs.pipecat.ai/deployment/pipecat-cloud/fundamentals/active-sessions) for REST and Python usage.
 
 ## Bot Variants
 
