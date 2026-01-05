@@ -47,11 +47,9 @@ N_GPU = 1
 MINUTES = 60  # seconds
 VLLM_PORT = 8000
 
-
 @app.function(
     image=vllm_image,
     gpu=f"B200:{N_GPU}",
-    memory=128 * 1024, # 128
     scaledown_window=15 * MINUTES,  # how long should we stay up with no requests?
     timeout=60 * MINUTES,  # how long should we wait for container start?
     volumes={
