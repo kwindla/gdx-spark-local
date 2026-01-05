@@ -53,6 +53,7 @@ from pipecat.frames.frames import (
     SystemFrame,
 )
 from pipecat.metrics.metrics import LLMTokenUsage, LLMUsageMetricsData
+from pipecat.adapters.services.open_ai_adapter import OpenAILLMAdapter
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.ai_service import AIService
@@ -435,6 +436,10 @@ class LlamaCppBufferedLLMService(AIService):
         # Trim messages to fit context window, then format
         messages = self._trim_messages_to_fit_context(messages)
         self._prompt = self._format_messages(messages)
+
+        # Log context for debugging (use OpenAI adapter since llama.cpp uses OpenAI-compatible format)
+        adapter = OpenAILLMAdapter()
+        logger.debug(f"{self}: Generating chat: {adapter.get_messages_for_logging(context)}")
 
         # Segment limits - first segment uses equal max/hard_max
         max_tokens = self._params.first_segment_max_tokens

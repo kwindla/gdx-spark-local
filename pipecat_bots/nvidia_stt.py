@@ -189,6 +189,8 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
                 self._pending_frame_direction = direction
                 self._start_pending_frame_timeout()
                 logger.debug(f"{self} holding UserStoppedSpeakingFrame at {time.time():.3f}")
+                # Start STT metric timer here (not at VAD) to measure just finalization time
+                self._vad_stopped_time = time.time()
                 # Send HARD reset to capture trailing words like "and" in "speaker and"
                 # Hard reset uses padding + keep_all_outputs=True, then resets decoder
                 await self._send_reset(finalize=True)
@@ -206,7 +208,6 @@ class NVidiaWebSocketSTTService(WebsocketSTTService):
         # decoder finalization (no keep_all_outputs=True), preserving decoder state.
         if isinstance(frame, VADUserStoppedSpeakingFrame):
             self._waiting_for_final = True
-            self._vad_stopped_time = time.time()  # Start STT metric timer
             await self._send_reset(finalize=False)  # Soft reset
 
     async def _send_reset(self, finalize: bool = True):

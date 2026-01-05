@@ -544,25 +544,22 @@ class ASRServer:
             f"(cumulative='{final_text[-50:] if len(final_text) > 50 else final_text}')"
         )
 
-        # Remove padding (restore to original audio length)
-        if original_audio_length > 0:
-            session.accumulated_audio = session.accumulated_audio[:original_audio_length]
-        else:
-            session.accumulated_audio = np.array([], dtype=np.float32)
-
-        # CONTINUOUS SESSION: Keep ALL state intact
-        # The decoder state is preserved to maintain context for subsequent audio.
-        # Server-side deduplication via last_emitted_text ensures clients receive
-        # only new text portions, avoiding downstream duplication in aggregators.
+        # MEMORY BOUNDING: Clear all state after hard reset
+        # This prevents unbounded memory growth by resetting completely each turn:
+        # - Audio buffer: cleared (no carryover between turns)
+        # - Decoder state: reset fresh (no hypothesis accumulation)
+        # - Encoder cache: re-initialized
         #
-        # Note: We considered resetting decoder to prevent corruption from multiple
-        # keep_all_outputs=True calls, but this breaks transcription continuity.
-        # The soft/hard reset distinction helps by limiting keep_all_outputs=True
-        # to only UserStoppedSpeakingFrame events.
+        # We considered keeping audio overlap for encoder context continuity,
+        # but since we reset the encoder cache, overlap audio would just be
+        # re-transcribed, causing duplicates. Clean reset avoids this.
+
+        session.last_emitted_text = ""
+        session.overlap_buffer = None
+        self._init_session(session)
 
         logger.debug(
-            f"Session {session.id} hard reset complete, state preserved: "
-            f"{len(session.accumulated_audio)} samples, {session.emitted_frames} frames"
+            f"Session {session.id} hard reset complete, state fully reset for next turn"
         )
 
     def _process_final_chunk(self, session: ASRSession) -> Optional[str]:
