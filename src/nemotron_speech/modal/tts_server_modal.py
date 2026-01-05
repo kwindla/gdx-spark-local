@@ -313,7 +313,7 @@ def _overlap_add(chunk1_tail: bytes, chunk2_head: bytes) -> bytes:
     gpu="A100",  # Use A100 GPU for fast inference
     secrets=[modal.Secret.from_name("huggingface-secret")],  # HF token for model download
     timeout=3600,  # 1 hour timeout for long-running requests
-    min_containers = 1,
+    # min_containers = 1,
 )
 class MagpieTTSModel:
     """Modal class for Magpie TTS inference."""

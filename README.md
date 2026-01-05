@@ -60,6 +60,10 @@ modal setup
 
 # Set HuggingFace token for gated model access (if necessary)
 modal secret create huggingface HF_TOKEN=your_token_here
+
+# TEMP: upload the ASR model weights to a modal Volume
+modal volume create nemotron-speech
+modal volume put nemotron-speech /path/to/local/weights.nemo
 ```
 
 ### Deploy Services to Modal
@@ -74,6 +78,8 @@ modal deploy -m src.nemotron_speech.modal.tts_server_modal
 # Deploy vLLM service
 modal deploy -m src.nemotron_speech.modal.vllm_modal
 ```
+
+The ASR deployment takes about 30 seconds to cold-start, 60 seconds for TTS, and about 3 minutes for vLLM. You can uncomment the `min_containers = 1` input to the Modal `Function` and `Cls` decorators to ensure that bots can start up quickly for production or development.
 
 ### Run the bot locally or using Pipecat Cloud
 ```bash
