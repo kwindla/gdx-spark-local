@@ -34,6 +34,7 @@ VALID_SERVICES = [
     'elevenlabs',
     'cartesia',
     'faster_whisper',
+    'speechmatics',
 ]
 
 GROUND_TRUTH_FILE = 'asr_eval_data/ground_truth_runs/2026-01-03_17-00-06.jsonl'

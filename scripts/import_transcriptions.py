@@ -16,6 +16,7 @@ SERVICE_MAP = {
     ("cartesia", "default"): "cartesia",
     ("elevenlabs", "scribe_v2_realtime"): "elevenlabs",
     ("nvidia_parakeet", "default"): "nvidia_parakeet",
+    ("speechmatics", "default"): "speechmatics",
 }
 
 
