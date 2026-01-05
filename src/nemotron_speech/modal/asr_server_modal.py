@@ -4,10 +4,10 @@ Deploy to Modal with GPU support for real-time speech recognition.
 
 Usage:
     # Deploy to Modal
-    modal deploy src/nemotron_speech/modal/asr_server_modal.py
+    modal deploy -m src.nemotron_speech.modal.asr_server_modal
 
     # Test locally
-    python src/nemotron_speech/modal/asr_server_modal.py
+    python -m src.nemotron_speech.modal.asr_server_modal
 
 Environment:
     Model weights expected in Modal volume at /model/Parakeet_Reatime_En_600M.nemo
@@ -112,6 +112,17 @@ class ASRSession:
 
 RIGHT_CONTEXT = 1
 
+with image.imports():
+    import time
+    import torch
+    import traceback
+    from loguru import logger
+    import nemo.collections.asr as nemo_asr
+    from omegaconf import OmegaConf
+
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    import uuid
+
 
 # Modal class for ASR inference
 @app.cls(
@@ -129,10 +140,7 @@ class NemotronASRModel:
     @modal.enter()
     def load_model(self):
         """Load model on container startup."""
-        import torch
-        from loguru import logger
-        import nemo.collections.asr as nemo_asr
-        from omegaconf import OmegaConf
+        
         
         logger.info(f"Loading ASR model from {MODEL_PATH}...")
         
@@ -213,8 +221,6 @@ class NemotronASRModel:
     
     def _warmup(self):
         """Run warmup inference using streaming API to claim GPU memory."""
-        import torch
-        from loguru import logger
         
         logger.info("Running warmup inference (streaming API) to claim GPU memory...")
         start = time.perf_counter()
@@ -258,7 +264,6 @@ class NemotronASRModel:
         prepended to the accumulated audio to provide encoder left-context.
         This enables seamless transcription across mid-utterance resets.
         """
-        from loguru import logger
         
         # Initialize encoder cache
         cache = self.model.encoder.get_initial_cache_state(batch_size=1)
@@ -288,7 +293,6 @@ class NemotronASRModel:
     
     async def _handle_audio(self, session: ASRSession, audio_bytes: bytes):
         """Accumulate audio and process when enough frames available."""
-        from loguru import logger
         
         audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         
@@ -322,8 +326,6 @@ class NemotronASRModel:
     
     def _process_chunk(self, session: ASRSession) -> Optional[str]:
         """Process accumulated audio, extract new mel frames, run streaming inference."""
-        import torch
-        from loguru import logger
         
         try:
             # Preprocess ALL accumulated audio
@@ -399,9 +401,7 @@ class NemotronASRModel:
                 return session.current_text
         
         except Exception as e:
-            from loguru import logger
             logger.error(f"Session {session.id} chunk processing error: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             return None
     
@@ -426,9 +426,7 @@ class NemotronASRModel:
         - Resets decoder state to prevent corruption from multiple hard resets
         - Preserves encoder cache for acoustic context
         - Used on UserStoppedSpeakingFrame for complete transcription
-        """
-        from loguru import logger
-        import time
+        """        
         
         logger.info(f"Session {session.id} _reset_session START: finalize={finalize}")
         
@@ -544,8 +542,6 @@ class NemotronASRModel:
     
     def _process_final_chunk(self, session: ASRSession) -> Optional[str]:
         """Process all remaining audio with keep_all_outputs=True."""
-        import torch
-        from loguru import logger
         
         try:
             if len(session.accumulated_audio) == 0:
@@ -624,18 +620,13 @@ class NemotronASRModel:
                 return session.current_text
         
         except Exception as e:
-            from loguru import logger
             logger.error(f"Session {session.id} final chunk error: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             return None
     
     @modal.asgi_app()
     def api(self):
         """FastAPI app with ASR WebSocket endpoint."""
-        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-        from loguru import logger
-        import uuid
         
         web_app = FastAPI(
             title="Nemotron ASR Server (Modal)",
@@ -702,7 +693,6 @@ class NemotronASRModel:
                                     logger.info(f"Client {session_id}: _reset_session completed successfully")
                                 except Exception as e:
                                     logger.error(f"Client {session_id}: _reset_session failed: {e}")
-                                    import traceback
                                     logger.error(traceback.format_exc())
                                     raise
                             else:
@@ -721,7 +711,6 @@ class NemotronASRModel:
             
             except Exception as e:
                 logger.error(f"Client {session_id} error: {e}")
-                import traceback
                 logger.error(traceback.format_exc())
                 try:
                     await websocket.send_json({

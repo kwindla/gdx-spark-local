@@ -4,14 +4,11 @@ Deploy to Modal with GPU support for fast TTS inference.
 
 Usage:
     # Deploy to Modal
-    modal deploy tts_server_modal.py
-
-    # Run locally with Modal (for testing)
-    modal serve tts_server_modal.py
+    modal deploy -m src.nemotron_speech.modal.tts_server_modal
 
 Environment:
-    Requires HUGGINGFACE_ACCESS_TOKEN secret in Modal
-    Set up with: modal secret create huggingface HUGGINGFACE_ACCESS_TOKEN=hf_...
+    Requires 'huggingface-secret' secret in Modal
+    Set up with: modal secret create huggingface-secret HF_TOKEN=hf_...
 """
 
 import asyncio
@@ -40,8 +37,6 @@ image = (
         {
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
             "HF_HOME": CACHE_PATH,
-            # "CXX": "g++",
-            # "CC": "g++",
             "TORCH_HOME": CACHE_PATH,
         }
     )
@@ -54,16 +49,8 @@ image = (
         "pydantic",
         "loguru",
         "numpy<2.0.0",
-        # "cdifflib",
-        # Additional NeMo dependencies
-        # "Cython",
-        # "webdataset",
         "omegaconf",
         "hydra-core",
-        # "pytorch-lightning",
-        # "wandb",
-        # "nemo_toolkit[tts]==2.6.0",
-        # "cdifflib==1.2.9",
     ).uv_pip_install(
         "nemo_toolkit[tts]@git+https://github.com/NVIDIA/NeMo.git@644201898480ec8c8d0a637f0c773825509ac4dc",
         extra_options="--no-cache",
@@ -303,6 +290,21 @@ def _overlap_add(chunk1_tail: bytes, chunk2_head: bytes) -> bytes:
 
     return np.clip(blended, -32768, 32767).astype(np.int16).tobytes()
 
+with image.imports():
+    import traceback
+    import torch
+    from loguru import logger
+    from nemo.collections.tts.models import MagpieTTSModel
+    import queue
+    from dataclasses import replace
+    
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
+    from fastapi.responses import Response
+    from pydantic import BaseModel
+
+    from ..streaming_tts import StreamingMagpieTTS, StreamingConfig, STREAMING_PRESETS
+    from ..adaptive_stream import get_stream_manager, StreamState, TTSStream
+    
 
 # Modal class for TTS inference
 @app.cls(
@@ -315,22 +317,13 @@ def _overlap_add(chunk1_tail: bytes, chunk2_head: bytes) -> bytes:
     timeout=3600,  # 1 hour timeout for long-running requests
     # min_containers = 1,
 )
-class MagpieTTSModel:
+class MagpieTTSServer:
     """Modal class for Magpie TTS inference."""
 
     @modal.enter()
     def load_model(self):
         """Load model on container startup."""
-        import sys
-        import torch
-        from loguru import logger
-        from nemo.collections.tts.models import MagpieTTSModel
         
-        # Add local module to path
-        sys.path.insert(0, "/root")
-        
-        from ..streaming_tts import StreamingMagpieTTS, StreamingConfig
-
         logger.info("Loading Magpie TTS model...")
         model_id = "nvidia/magpie_tts_multilingual_357m"
 
@@ -380,7 +373,7 @@ class MagpieTTSModel:
 
     def _synthesize_batch(self, text: str, voice: str = "aria", language: str = "en") -> bytes:
         """Internal: Synthesize speech in batch mode (full generation)."""
-        import torch
+        
 
         text = normalize_text(text)
         speaker_idx = SPEAKERS.get(voice.lower(), 2)
@@ -432,19 +425,18 @@ class MagpieTTSModel:
         Yields:
             bytes: Audio chunks ready for streaming
         """
-        import queue
+        
         
         logger.debug(f"Importing StreamingMagpieTTS from ..streaming_tts")
         try:
-            from ..streaming_tts import StreamingMagpieTTS, STREAMING_PRESETS
+            
             logger.debug(f"Successfully imported StreamingMagpieTTS and STREAMING_PRESETS")
         except Exception as e:
             logger.error(f"Failed to import streaming_tts: {e}")
-            import traceback
             logger.error(traceback.format_exc())
             raise
             
-        from dataclasses import replace
+        
 
         # Get preset config
         base_config = STREAMING_PRESETS.get(preset, STREAMING_PRESETS["conservative"])
@@ -481,7 +473,6 @@ class MagpieTTSModel:
                 logger.debug(f"Generation complete: {chunk_count} chunks total")
             except Exception as e:
                 logger.error(f"Error in run_generation: {e}")
-                import traceback
                 logger.error(traceback.format_exc())
                 generation_error = e
             finally:
@@ -589,16 +580,6 @@ class MagpieTTSModel:
     @modal.asgi_app()
     def api(self):
         """FastAPI app with all TTS endpoints."""
-        import sys
-        from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
-        from fastapi.responses import Response
-        from pydantic import BaseModel
-        from loguru import logger
-        
-        # Add local module to path
-        sys.path.insert(0, "/root")
-        
-        from ..adaptive_stream import get_stream_manager, StreamState, TTSStream
 
         # Pydantic models for request validation
         class SpeechRequest(BaseModel):
@@ -774,7 +755,6 @@ class MagpieTTSModel:
                                     logger.debug(f"[{stream.stream_id[:8]}] Streaming segment complete")
                                 except Exception as e:
                                     logger.error(f"[{stream.stream_id[:8]}] Error in streaming generation: {e}")
-                                    import traceback
                                     logger.error(traceback.format_exc())
                                     raise
                             
@@ -850,7 +830,6 @@ class MagpieTTSModel:
                     logger.debug(f"[{stream.stream_id[:8]}] WS audio task cancelled")
                     raise
                 except Exception as e:
-                    import traceback
                     logger.error(f"[{stream.stream_id[:8]}] WS audio generation error: {e}\n{traceback.format_exc()}")
                     try:
                         await websocket.send_json({
@@ -1013,7 +992,7 @@ if __name__ == "__main__":
     
     # Get the deployed API URL
     print("Getting deployed API URL...")
-    MagpieClass = modal.Cls.from_name("magpie-tts-server", "MagpieTTSModel")
+    MagpieClass = modal.Cls.from_name("magpie-tts-server", "MagpieTTSServer")
     api_url = MagpieClass().api.web_url
     print(f"API URL: {api_url}")
     print()

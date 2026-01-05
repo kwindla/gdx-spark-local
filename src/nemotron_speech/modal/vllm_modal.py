@@ -1,10 +1,9 @@
 # Modal deployment for Nemotron Nano vLLM server.
 
-
 import json
 from typing import Any
-
 import aiohttp
+
 import modal
 
 MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"
@@ -15,28 +14,19 @@ vllm_image = (
     .uv_pip_install(
         "vllm>=0.12.0",
         "huggingface-hub==0.36.0",
-        # "flashinfer-python",
         "flashinfer-cubin",
         "cuda-python==12.8.0",
-    )
-    .apt_install("wget")
-    .run_commands(
-        f"wget https://huggingface.co/{MODEL_NAME}/resolve/main/nano_v3_reasoning_parser.py",
     )
     .env({
         "HF_XET_HIGH_PERFORMANCE": "1",
         "HF_HOME": "/root/.cache/huggingface",
         "VLLM_CACHE_ROOT": "/root/.cache/vllm",
-        # "VLLM_USE_FLASHINFER_MOE_FP8": "1",
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
         "VLLM_LOGGING_LEVEL": "DEBUG",
-    })  # faster model transfers
-    
+    }) 
 )
 
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
-
-
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 
 FAST_BOOT = False
@@ -46,6 +36,10 @@ app = modal.App("nemotron-nano-vllm")
 N_GPU = 1
 MINUTES = 60  # seconds
 VLLM_PORT = 8000
+
+with vllm_image.imports():
+    import subprocess
+    import torch
 
 @app.function(
     image=vllm_image,
@@ -63,8 +57,6 @@ VLLM_PORT = 8000
 )
 @modal.web_server(port=VLLM_PORT, startup_timeout=60 * MINUTES)
 def serve():
-    import subprocess
-    import torch
 
     torch.set_float32_matmul_precision('high')
 
