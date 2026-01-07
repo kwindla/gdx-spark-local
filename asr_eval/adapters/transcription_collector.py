@@ -21,6 +21,8 @@ from pipecat.frames.frames import (
     TranscriptionFrame,
     VADUserStoppedSpeakingFrame,
 )
+
+from asr_eval.adapters.synthetic_input_transport import AudioPlaybackCompleteFrame
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 
@@ -72,13 +74,33 @@ class TranscriptionTiming:
         This is the key latency metric: time from when the user actually
         stops speaking to when we receive the final TranscriptionFrame.
 
-        Formula: (Tf - Tvad) * 1000 + stop_secs * 1000
+        Reference time selection:
+        - If VAD fired AFTER audio finished (fresh VAD during silence phase),
+          use vad_stopped_time as the reference
+        - If VAD fired BEFORE audio finished (stale mid-utterance pause),
+          use audio_finished_time as the reference
+
+        Formula: (Tf - ref_time) * 1000 + stop_secs * 1000
 
         The stop_secs offset accounts for VAD detection delay - VAD fires
         after stop_secs of silence, so actual speech ended stop_secs earlier.
         """
-        ref_time = self.vad_stopped_time or self.audio_finished_time
-        if ref_time and self.final_result_time:
+        if not self.final_result_time:
+            return None
+
+        # Determine the right reference time
+        if self.vad_stopped_time and self.audio_finished_time:
+            # Use VAD time only if it's after audio finished (fresh VAD)
+            if self.vad_stopped_time >= self.audio_finished_time:
+                ref_time = self.vad_stopped_time
+            else:
+                # Stale VAD from mid-utterance pause - use audio end instead
+                ref_time = self.audio_finished_time
+        else:
+            # Fallback to whichever is available
+            ref_time = self.vad_stopped_time or self.audio_finished_time
+
+        if ref_time:
             raw_latency = (self.final_result_time - ref_time) * 1000
             return raw_latency + (self.vad_stop_secs * 1000)
         return None
@@ -172,7 +194,13 @@ class TranscriptionCollector(FrameProcessor):
         if isinstance(frame, InputAudioRawFrame) and self._capture_audio_path:
             self._captured_audio.extend(frame.audio)
 
-        if isinstance(frame, VADUserStoppedSpeakingFrame):
+        if isinstance(frame, AudioPlaybackCompleteFrame):
+            # Record when audio playback finished (before silence phase)
+            # This is the accurate reference for latency measurement
+            self._result.timing.audio_finished_time = now
+            logger.debug(f"Audio playback complete at {now:.3f}")
+
+        elif isinstance(frame, VADUserStoppedSpeakingFrame):
             # Record VAD stopped time for accurate latency measurement
             self._result.timing.vad_stopped_time = now
             logger.debug(f"VAD stopped at {now:.3f}")

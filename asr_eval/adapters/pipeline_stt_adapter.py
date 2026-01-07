@@ -215,8 +215,8 @@ class PipelineSTTAdapter:
                 # The transport now waits for queue.join() before signaling complete
                 await transport.wait_for_audio_complete(timeout=60.0)
 
-                # Mark when audio finished being sent
-                collector.mark_audio_finished()
+                # Note: audio_finished_time is set by AudioPlaybackCompleteFrame
+                # which the transport pushes at the exact moment audio ends
 
                 # Wait for transcription result with timeout
                 # This waits for TranscriptionFrame to arrive
